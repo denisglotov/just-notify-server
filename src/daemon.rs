@@ -118,7 +118,13 @@ pub async fn run_daemon(
 
             // Kademlia store & config
             let store = kad::store::MemoryStore::new(peer_id);
-            let mut kademlia = kad::Behaviour::new(peer_id, store);
+            let mut kad_config = kad::Config::default();
+            kad_config.set_query_timeout(Duration::from_secs(60));
+            if let Some(replication) = std::num::NonZeroUsize::new(20) {
+                kad_config.set_replication_factor(replication);
+            }
+            kad_config.set_provider_publication_interval(Some(Duration::from_secs(1800)));
+            let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
 
             // Identify
@@ -308,7 +314,14 @@ pub async fn run_daemon(
 
             // Swarm events
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut pending_searches, &mut bootstrapped);
+                handle_swarm_event(
+                    event,
+                    &mut swarm,
+                    &mut pending_searches,
+                    &mut bootstrapped,
+                    &record_key,
+                    &service_name,
+                );
             }
         }
     }
@@ -354,6 +367,8 @@ fn handle_ipc_request(
     match request {
         IpcRequest::Info => {
             let listen_addrs: Vec<String> = swarm.listeners().map(|a| a.to_string()).collect();
+            let external_addrs: Vec<String> =
+                swarm.external_addresses().map(|a| a.to_string()).collect();
             let num_peers = swarm.connected_peers().count();
             let mut kbucket_count = 0;
             for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
@@ -363,6 +378,7 @@ fn handle_ipc_request(
             let info_json = serde_json::json!({
                 "peer_id": local_peer_id.to_string(),
                 "listen_addresses": listen_addrs,
+                "external_addresses": external_addrs,
                 "connected_peers_count": num_peers,
                 "routing_table_entries": kbucket_count,
             });
@@ -415,7 +431,8 @@ fn handle_ipc_request(
                 initial_providers.insert(provider, addrs);
             }
             if service_name == daemon_service_name {
-                let local_addrs: HashSet<Multiaddr> = swarm.listeners().cloned().collect();
+                let mut local_addrs: HashSet<Multiaddr> = swarm.listeners().cloned().collect();
+                local_addrs.extend(swarm.external_addresses().cloned());
                 initial_providers
                     .entry(local_peer_id)
                     .or_default()
@@ -498,10 +515,25 @@ fn handle_swarm_event(
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
     bootstrapped: &mut bool,
+    record_key: &kad::RecordKey,
+    service_name: &str,
 ) {
     match event {
         libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
             info!("Listening on multiaddress: {}", address);
+        }
+        libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+            info!("Confirmed external public address: {}", address);
+            if let Err(e) = swarm
+                .behaviour_mut()
+                .kademlia
+                .start_providing(record_key.clone())
+            {
+                debug!("Start providing on external address confirmation: {:?}", e);
+            }
+        }
+        libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
+            debug!("New external address candidate: {}", address);
         }
         libp2p::swarm::SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
@@ -519,7 +551,7 @@ fn handle_swarm_event(
             debug!("Connection closed with peer {}: {:?}", peer_id, cause);
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Kademlia(kad_event)) => {
-            handle_kademlia_event(kad_event, swarm, pending_searches);
+            handle_kademlia_event(kad_event, swarm, pending_searches, record_key, service_name);
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
             identify::Event::Received { peer_id, info, .. },
@@ -528,6 +560,13 @@ fn handle_swarm_event(
                 "Identify received from {}: agent='{}', protocols={:?}",
                 peer_id, info.agent_version, info.protocols
             );
+            // Register observed address as external address on the swarm
+            info!(
+                "Observed external address candidate from {}: {}",
+                peer_id, info.observed_addr
+            );
+            swarm.add_external_address(info.observed_addr.clone());
+
             // Kademlia requires manual insertion of discovered peers into its routing table
             for addr in info.listen_addrs {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
@@ -550,7 +589,14 @@ fn handle_swarm_event(
             }
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(autonat_event)) => {
-            debug!("AutoNAT event: {:?}", autonat_event);
+            match autonat_event {
+                autonat::Event::StatusChanged { old, new } => {
+                    info!("AutoNAT status changed from {:?} to {:?}", old, new);
+                }
+                _ => {
+                    debug!("AutoNAT event: {:?}", autonat_event);
+                }
+            }
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Ping(ping_event)) => {
             debug!("Ping event: {:?}", ping_event);
@@ -563,6 +609,8 @@ fn handle_kademlia_event(
     event: kad::Event,
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
+    record_key: &kad::RecordKey,
+    service_name: &str,
 ) {
     match event {
         kad::Event::OutboundQueryProgressed {
@@ -612,6 +660,19 @@ fn handle_kademlia_event(
                         "Kademlia bootstrap progress: peer={}, remaining={}",
                         peer, num_remaining
                     );
+                    if num_remaining == 0 {
+                        info!(
+                            "Kademlia routing table bootstrap complete! Re-announcing provider record for '{}'...",
+                            service_name
+                        );
+                        if let Err(e) = swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .start_providing(record_key.clone())
+                        {
+                            debug!("Start providing on bootstrap completion: {:?}", e);
+                        }
+                    }
                 }
                 kad::QueryResult::Bootstrap(Err(e)) => {
                     debug!("Kademlia bootstrap query returned: {:?}", e);
