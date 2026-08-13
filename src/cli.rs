@@ -51,6 +51,10 @@ pub enum Commands {
         /// Path to daemon Unix Domain Socket
         #[arg(long, default_value = "/tmp/ipfs-server.sock")]
         socket_path: PathBuf,
+
+        /// Search timeout in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
 
     /// Query connected peers from the running daemon

@@ -144,18 +144,35 @@ cargo run -- info
 cargo run -- peers
 ```
 
+**Output**:
+```json
+{
+  "peers": [
+    {
+      "peer_id": "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+      "ip_addresses": [
+        "ny5.bootstrap.libp2p.io"
+      ],
+      "addresses": [
+        "/dns4/ny5.bootstrap.libp2p.io/tcp/4001"
+      ]
+    }
+  ]
+}
+```
+
 #### Search IPFS Mainnet DHT for Service Providers
 
-By default, searches for providers of `"dymka-just-notify"`:
+By default, searches for providers of `"dymka-just-notify"` (default timeout: 30s):
 
 ```bash
 cargo run -- search
 ```
 
-Or specify a custom service name or CID string:
+Or specify a custom service name/CID and search timeout:
 
 ```bash
-cargo run -- search dymka-just-notify
+cargo run -- search dymka-just-notify --timeout 45
 ```
 
 **Output**:
@@ -163,7 +180,16 @@ cargo run -- search dymka-just-notify
 {
   "cid": "bafkreibjxsnlwqya5jwmorqbygtlwozk6rc4ociq6swm7u7jkzch7j3lxm",
   "providers": [
-    "12D3KooWQycFDbBXXu598U7pQPzpSmmvcG6TuGVLRLSrck6Bdnhr"
+    {
+      "peer_id": "12D3KooWQycFDbBXXu598U7pQPzpSmmvcG6TuGVLRLSrck6Bdnhr",
+      "ip_addresses": [
+        "192.168.50.156"
+      ],
+      "addresses": [
+        "/ip4/192.168.50.156/tcp/4001",
+        "/ip4/192.168.50.156/udp/4001/quic-v1"
+      ]
+    }
   ],
   "service": "dymka-just-notify"
 }

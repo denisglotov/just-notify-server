@@ -40,6 +40,33 @@ pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
     None
 }
 
+/// Extracts distinct IP addresses or hostnames from a collection of multiaddresses.
+pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
+    let mut ips = std::collections::HashSet::new();
+    for addr in addrs {
+        for protocol in addr.iter() {
+            match protocol {
+                libp2p::multiaddr::Protocol::Ip4(ip) => {
+                    ips.insert(ip.to_string());
+                }
+                libp2p::multiaddr::Protocol::Ip6(ip) => {
+                    ips.insert(ip.to_string());
+                }
+                libp2p::multiaddr::Protocol::Dns(dns)
+                | libp2p::multiaddr::Protocol::Dns4(dns)
+                | libp2p::multiaddr::Protocol::Dns6(dns)
+                | libp2p::multiaddr::Protocol::Dnsaddr(dns) => {
+                    ips.insert(dns.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut ip_list: Vec<String> = ips.into_iter().collect();
+    ip_list.sort();
+    ip_list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +98,24 @@ mod tests {
         assert_eq!(
             peer_id.to_string(),
             "QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
+        );
+    }
+
+    #[test]
+    fn test_extract_ip_addresses() {
+        let addr1: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
+        let addr2: libp2p::Multiaddr = "/ip4/192.168.1.100/udp/4001/quic-v1".parse().unwrap();
+        let addr3: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/4001".parse().unwrap();
+        let addr4: libp2p::Multiaddr = "/dns4/ny5.bootstrap.libp2p.io/tcp/4001".parse().unwrap();
+
+        let ips = extract_ip_addresses(&[addr1, addr2, addr3, addr4]);
+        assert_eq!(
+            ips,
+            vec![
+                "10.0.0.1".to_string(),
+                "192.168.1.100".to_string(),
+                "ny5.bootstrap.libp2p.io".to_string()
+            ]
         );
     }
 }

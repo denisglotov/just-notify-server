@@ -1,23 +1,31 @@
 use crate::behaviour::{AppBehaviour, AppBehaviourEvent};
 use crate::ipc::{IpcRequest, IpcResponse};
-use crate::service_key;
+use crate::service_key::{self, extract_ip_addresses, extract_peer_id};
 
 use anyhow::Context;
 use futures::{SinkExt, StreamExt};
+use libp2p::kad::store::RecordStore;
 use libp2p::{autonat, identify, identity, kad, ping, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{debug, error, info, warn};
 
-use crate::service_key::extract_peer_id;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredProvider {
+    pub peer_id: String,
+    pub ip_addresses: Vec<String>,
+    pub addresses: Vec<String>,
+}
 
 struct PendingSearch {
-    providers: HashSet<PeerId>,
-    sender: oneshot::Sender<Vec<String>>,
+    providers: Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
+    sender: oneshot::Sender<Vec<DiscoveredProvider>>,
 }
 
 enum DaemonEvent {
@@ -244,6 +252,7 @@ pub async fn run_daemon(
     });
 
     let mut pending_searches: HashMap<kad::QueryId, PendingSearch> = HashMap::new();
+    let mut bootstrapped = false;
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -290,6 +299,7 @@ pub async fn run_daemon(
                             responder,
                             &mut swarm,
                             local_peer_id,
+                            &service_name,
                             &mut pending_searches,
                         );
                     }
@@ -298,7 +308,7 @@ pub async fn run_daemon(
 
             // Swarm events
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut pending_searches);
+                handle_swarm_event(event, &mut swarm, &mut pending_searches, &mut bootstrapped);
             }
         }
     }
@@ -338,6 +348,7 @@ fn handle_ipc_request(
     responder: oneshot::Sender<IpcResponse>,
     swarm: &mut Swarm<AppBehaviour>,
     local_peer_id: PeerId,
+    daemon_service_name: &str,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
 ) {
     match request {
@@ -360,38 +371,83 @@ fn handle_ipc_request(
         }
 
         IpcRequest::Peers => {
-            let peers: Vec<serde_json::Value> = swarm
-                .connected_peers()
-                .map(|p| serde_json::json!({ "peer_id": p.to_string() }))
-                .collect();
+            let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+            let mut peers = Vec::new();
+            for p in connected {
+                let addrs = get_kademlia_peer_addresses(&mut swarm.behaviour_mut().kademlia, &p);
+                let ip_addresses = extract_ip_addresses(&addrs);
+                peers.push(serde_json::json!({
+                    "peer_id": p.to_string(),
+                    "ip_addresses": ip_addresses,
+                    "addresses": addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                }));
+            }
 
             let _ = responder.send(IpcResponse::Success {
                 data: serde_json::json!({ "peers": peers }),
             });
         }
 
-        IpcRequest::Search { service_name } => {
+        IpcRequest::Search {
+            service_name,
+            timeout_secs,
+        } => {
             let (cid, mhash) = service_key::derive_service_multihash(&service_name);
             let record_key = kad::RecordKey::new(&mhash.to_bytes());
+
+            // Collect known local providers and their addresses
+            let mut initial_providers: HashMap<PeerId, HashSet<Multiaddr>> = HashMap::new();
+            let stored_records: Vec<(PeerId, Vec<Multiaddr>)> = swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .providers(&record_key)
+                .into_iter()
+                .map(|rec| (rec.provider, rec.addresses))
+                .collect();
+
+            for (provider, addresses) in stored_records {
+                let mut addrs: HashSet<Multiaddr> = addresses.into_iter().collect();
+                addrs.extend(get_kademlia_peer_addresses(
+                    &mut swarm.behaviour_mut().kademlia,
+                    &provider,
+                ));
+                initial_providers.insert(provider, addrs);
+            }
+            if service_name == daemon_service_name {
+                let local_addrs: HashSet<Multiaddr> = swarm.listeners().cloned().collect();
+                initial_providers
+                    .entry(local_peer_id)
+                    .or_default()
+                    .extend(local_addrs);
+            }
+
             let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
 
             info!(
-                "Triggered DHT provider search for '{}' (CID: {}, QueryID: {:?})",
-                service_name, cid, query_id
+                "Triggered DHT provider search for '{}' (CID: {}, QueryID: {:?}, known local: {})",
+                service_name,
+                cid,
+                query_id,
+                initial_providers.len()
             );
 
-            let (search_tx, search_rx) = oneshot::channel::<Vec<String>>();
+            let (search_tx, search_rx) = oneshot::channel::<Vec<DiscoveredProvider>>();
+            let shared_providers = Arc::new(Mutex::new(initial_providers));
             pending_searches.insert(
                 query_id,
                 PendingSearch {
-                    providers: HashSet::new(),
+                    providers: shared_providers.clone(),
                     sender: search_tx,
                 },
             );
 
-            // Spawn timeout task to complete search if DHT query finishes or times out in 8 seconds
+            let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(30));
+            let timeout_providers = shared_providers.clone();
+
+            // Spawn timeout task to complete search if DHT query finishes or times out
             tokio::spawn(async move {
-                let result = tokio::time::timeout(Duration::from_secs(8), search_rx).await;
+                let result = tokio::time::timeout(timeout_duration, search_rx).await;
                 let response = match result {
                     Ok(Ok(providers)) => IpcResponse::Success {
                         data: serde_json::json!({
@@ -400,12 +456,36 @@ fn handle_ipc_request(
                             "providers": providers
                         }),
                     },
-                    Ok(Err(_)) => IpcResponse::Error {
-                        message: "Search cancelled".to_string(),
-                    },
-                    Err(_) => IpcResponse::Error {
-                        message: "Search timed out while querying IPFS DHT".to_string(),
-                    },
+                    Ok(Err(_)) => {
+                        let providers = format_provider_results(&timeout_providers);
+                        IpcResponse::Success {
+                            data: serde_json::json!({
+                                "service": service_name,
+                                "cid": cid.to_string(),
+                                "providers": providers
+                            }),
+                        }
+                    }
+                    Err(_) => {
+                        let providers = format_provider_results(&timeout_providers);
+                        if !providers.is_empty() {
+                            IpcResponse::Success {
+                                data: serde_json::json!({
+                                    "service": service_name,
+                                    "cid": cid.to_string(),
+                                    "providers": providers,
+                                    "timed_out": true
+                                }),
+                            }
+                        } else {
+                            IpcResponse::Error {
+                                message: format!(
+                                    "Search timed out after {}s while querying IPFS DHT",
+                                    timeout_duration.as_secs()
+                                ),
+                            }
+                        }
+                    }
                 };
                 let _ = responder.send(response);
             });
@@ -417,6 +497,7 @@ fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>,
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
+    bootstrapped: &mut bool,
 ) {
     match event {
         libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
@@ -438,7 +519,7 @@ fn handle_swarm_event(
             debug!("Connection closed with peer {}: {:?}", peer_id, cause);
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Kademlia(kad_event)) => {
-            handle_kademlia_event(kad_event, pending_searches);
+            handle_kademlia_event(kad_event, swarm, pending_searches);
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
             identify::Event::Received { peer_id, info, .. },
@@ -450,6 +531,22 @@ fn handle_swarm_event(
             // Kademlia requires manual insertion of discovered peers into its routing table
             for addr in info.listen_addrs {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            }
+
+            // Once we have identified a peer, trigger routing table bootstrap if not already started
+            if !*bootstrapped {
+                match swarm.behaviour_mut().kademlia.bootstrap() {
+                    Ok(qid) => {
+                        info!(
+                            "Triggered Kademlia DHT routing table bootstrap (Query ID: {:?})",
+                            qid
+                        );
+                        *bootstrapped = true;
+                    }
+                    Err(e) => {
+                        debug!("Kademlia bootstrap trigger on identify info: {:?}", e);
+                    }
+                }
             }
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(autonat_event)) => {
@@ -464,6 +561,7 @@ fn handle_swarm_event(
 
 fn handle_kademlia_event(
     event: kad::Event,
+    swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
 ) {
     match event {
@@ -476,14 +574,26 @@ fn handle_kademlia_event(
                     ..
                 })) => {
                     info!("Found {} provider(s) for query {:?}", providers.len(), id);
-                    if let Some(pending) = pending_searches.get_mut(&id) {
+                    if let Some(pending) = pending_searches.get(&id) {
+                        let mut lock = pending.providers.lock().unwrap();
                         for p in providers {
-                            pending.providers.insert(p);
+                            let addrs: HashSet<Multiaddr> = get_kademlia_peer_addresses(
+                                &mut swarm.behaviour_mut().kademlia,
+                                &p,
+                            )
+                            .into_iter()
+                            .collect();
+                            lock.entry(p).or_default().extend(addrs);
                         }
                     }
                 }
+                kad::QueryResult::GetProviders(Ok(
+                    kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
+                )) => {
+                    debug!("DHT provider query {:?} finished searching records", id);
+                }
                 kad::QueryResult::GetProviders(Err(e)) => {
-                    warn!("DHT provider query {:?} returned error: {:?}", id, e);
+                    warn!("DHT provider query {:?} returned: {:?}", id, e);
                 }
                 kad::QueryResult::StartProviding(Ok(add_provider_ok)) => {
                     info!(
@@ -494,17 +604,29 @@ fn handle_kademlia_event(
                 kad::QueryResult::StartProviding(Err(e)) => {
                     warn!("Provider record announcement query returned: {:?}", e);
                 }
+                kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk {
+                    peer,
+                    num_remaining,
+                })) => {
+                    debug!(
+                        "Kademlia bootstrap progress: peer={}, remaining={}",
+                        peer, num_remaining
+                    );
+                }
+                kad::QueryResult::Bootstrap(Err(e)) => {
+                    debug!("Kademlia bootstrap query returned: {:?}", e);
+                }
                 _ => {}
             }
 
             if step.last {
                 if let Some(pending) = pending_searches.remove(&id) {
-                    info!("DHT provider search query {:?} completed", id);
-                    let provider_list: Vec<String> = pending
-                        .providers
-                        .into_iter()
-                        .map(|p| p.to_string())
-                        .collect();
+                    let provider_list = format_provider_results(&pending.providers);
+                    info!(
+                        "DHT provider search query {:?} completed with {} providers",
+                        id,
+                        provider_list.len()
+                    );
                     let _ = pending.sender.send(provider_list);
                 }
             }
@@ -518,6 +640,39 @@ fn handle_kademlia_event(
         }
         _ => {}
     }
+}
+
+fn format_provider_results(
+    providers_ref: &Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
+) -> Vec<DiscoveredProvider> {
+    let map = providers_ref.lock().unwrap();
+    let mut list = Vec::new();
+    for (peer, addrs_set) in map.iter() {
+        let mut addrs: Vec<Multiaddr> = addrs_set.iter().cloned().collect();
+        let ip_addresses = extract_ip_addresses(&addrs);
+        addrs.sort();
+        list.push(DiscoveredProvider {
+            peer_id: peer.to_string(),
+            ip_addresses,
+            addresses: addrs.into_iter().map(|a| a.to_string()).collect(),
+        });
+    }
+    list.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+    list
+}
+
+fn get_kademlia_peer_addresses(
+    kademlia: &mut kad::Behaviour<kad::store::MemoryStore>,
+    peer: &PeerId,
+) -> Vec<Multiaddr> {
+    for bucket in kademlia.kbuckets() {
+        for entry in bucket.iter() {
+            if entry.node.key.preimage() == peer {
+                return entry.node.value.clone().into_vec();
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn format_record_key(key: &kad::RecordKey) -> String {

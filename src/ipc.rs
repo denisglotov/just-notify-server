@@ -7,7 +7,11 @@ use tokio_util::codec::{Framed, LinesCodec};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum IpcRequest {
-    Search { service_name: String },
+    Search {
+        service_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
     Peers,
     Info,
 }
@@ -52,5 +56,44 @@ pub async fn send_ipc_request(
         Ok(response)
     } else {
         anyhow::bail!("Connection closed by daemon before response was received")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_request_search_serde() {
+        let req_with_timeout = IpcRequest::Search {
+            service_name: "test-service".to_string(),
+            timeout_secs: Some(45),
+        };
+        let serialized = serde_json::to_string(&req_with_timeout).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&serialized).unwrap();
+        match deserialized {
+            IpcRequest::Search {
+                service_name,
+                timeout_secs,
+            } => {
+                assert_eq!(service_name, "test-service");
+                assert_eq!(timeout_secs, Some(45));
+            }
+            _ => panic!("Expected Search variant"),
+        }
+
+        // Backward compatibility: deserializing without timeout_secs
+        let json_str = r#"{"type":"Search","payload":{"service_name":"test-service"}}"#;
+        let legacy: IpcRequest = serde_json::from_str(json_str).unwrap();
+        match legacy {
+            IpcRequest::Search {
+                service_name,
+                timeout_secs,
+            } => {
+                assert_eq!(service_name, "test-service");
+                assert_eq!(timeout_secs, None);
+            }
+            _ => panic!("Expected Search variant"),
+        }
     }
 }

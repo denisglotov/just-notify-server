@@ -52,13 +52,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Search {
             service_name,
             socket_path,
+            timeout,
         } => {
             println!(
-                "Querying daemon at {} for service '{}'...",
+                "Querying daemon at {} for service '{}' (timeout: {}s)...",
                 socket_path.display(),
-                service_name
+                service_name,
+                timeout
             );
-            let req = IpcRequest::Search { service_name };
+            let req = IpcRequest::Search {
+                service_name,
+                timeout_secs: Some(timeout),
+            };
             handle_ipc_result(send_ipc_request(&socket_path, &req).await);
         }
 
