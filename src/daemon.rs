@@ -600,6 +600,59 @@ fn handle_ipc_request(
 /// before the daemon accepts and advertises it.
 const OBSERVED_ADDR_QUORUM_THRESHOLD: usize = 3;
 
+/// Maximum number of unconfirmed candidate addresses tracked for quorum
+/// to prevent unbounded memory growth from arbitrary observed network addresses.
+const MAX_OBSERVED_CANDIDATES: usize = 200;
+
+/// Records an observed candidate address from a peer, evicting low-voted candidates
+/// if capacity is exceeded, and returning the address if quorum threshold is reached.
+fn record_observed_candidate_address(
+    observed_candidates_quorum: &mut HashMap<Multiaddr, HashSet<PeerId>>,
+    known_external_addrs: &mut HashSet<Multiaddr>,
+    clean_addr: Multiaddr,
+    peer_id: PeerId,
+) -> Option<(Multiaddr, usize)> {
+    // If the address is already confirmed and known, do not track it in candidate map
+    if known_external_addrs.contains(&clean_addr) {
+        return None;
+    }
+
+    // If candidate map is at capacity and this is a new candidate, evict candidate with fewest voters
+    if !observed_candidates_quorum.contains_key(&clean_addr)
+        && observed_candidates_quorum.len() >= MAX_OBSERVED_CANDIDATES
+    {
+        if let Some(least_candidate) = observed_candidates_quorum
+            .iter()
+            .min_by_key(|(_, voters)| voters.len())
+            .map(|(addr, _)| addr.clone())
+        {
+            observed_candidates_quorum.remove(&least_candidate);
+        }
+    }
+
+    let voters = observed_candidates_quorum
+        .entry(clean_addr.clone())
+        .or_default();
+    voters.insert(peer_id);
+    let quorum_count = voters.len();
+
+    if quorum_count >= OBSERVED_ADDR_QUORUM_THRESHOLD {
+        // Quorum reached: remove from candidate tracker to reclaim memory
+        observed_candidates_quorum.remove(&clean_addr);
+        if known_external_addrs.insert(clean_addr.clone()) {
+            Some((clean_addr, quorum_count))
+        } else {
+            None
+        }
+    } else {
+        debug!(
+            "Observed candidate address {} seen by {}/{} peers",
+            clean_addr, quorum_count, OBSERVED_ADDR_QUORUM_THRESHOLD
+        );
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>,
@@ -620,6 +673,7 @@ fn handle_swarm_event(
         }
         libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
             if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
+                observed_candidates_quorum.remove(&clean_addr);
                 if known_external_addrs.insert(clean_addr.clone()) {
                     info!("Confirmed external public address: {}", clean_addr);
                     swarm.add_external_address(clean_addr);
@@ -636,6 +690,7 @@ fn handle_swarm_event(
         libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
             if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
                 known_external_addrs.remove(&clean_addr);
+                observed_candidates_quorum.remove(&clean_addr);
                 swarm.remove_external_address(&clean_addr);
                 info!("External public address expired: {}", clean_addr);
             }
@@ -680,20 +735,17 @@ fn handle_swarm_event(
             if let Some(clean_addr) =
                 normalize_observed_address(&info.observed_addr, tcp_port, quic_port)
             {
-                let voters = observed_candidates_quorum
-                    .entry(clean_addr.clone())
-                    .or_default();
-                voters.insert(peer_id);
-                let quorum_count = voters.len();
-
-                if quorum_count >= OBSERVED_ADDR_QUORUM_THRESHOLD
-                    && known_external_addrs.insert(clean_addr.clone())
-                {
+                if let Some((confirmed_addr, quorum_count)) = record_observed_candidate_address(
+                    observed_candidates_quorum,
+                    known_external_addrs,
+                    clean_addr,
+                    peer_id,
+                ) {
                     info!(
                         "External public address confirmed by quorum ({} distinct peers): {}",
-                        quorum_count, clean_addr
+                        quorum_count, confirmed_addr
                     );
-                    swarm.add_external_address(clean_addr);
+                    swarm.add_external_address(confirmed_addr);
                     if let Err(e) = swarm
                         .behaviour_mut()
                         .kademlia
@@ -704,11 +756,6 @@ fn handle_swarm_event(
                             e
                         );
                     }
-                } else if quorum_count < OBSERVED_ADDR_QUORUM_THRESHOLD {
-                    debug!(
-                        "Observed candidate address {} seen by {}/{} peers",
-                        clean_addr, quorum_count, OBSERVED_ADDR_QUORUM_THRESHOLD
-                    );
                 }
             }
 
@@ -744,6 +791,7 @@ fn handle_swarm_event(
                         if let Some(clean_addr) =
                             normalize_observed_address(public_addr, tcp_port, quic_port)
                         {
+                            observed_candidates_quorum.remove(&clean_addr);
                             if known_external_addrs.insert(clean_addr.clone()) {
                                 info!("AutoNAT confirmed public external address: {}", clean_addr);
                                 swarm.add_external_address(clean_addr);
@@ -1151,5 +1199,118 @@ mod tests {
         assert_eq!(pending_searches.len(), 1);
         assert!(pending_searches.contains_key(&dummy_qid2));
         assert!(!pending_searches.contains_key(&dummy_qid1));
+    }
+
+    #[test]
+    fn test_observed_candidates_quorum_lifecycle() {
+        let mut quorum_map: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
+        let mut known_addrs: HashSet<Multiaddr> = HashSet::new();
+
+        let addr: Multiaddr = "/ip4/198.51.100.1/tcp/4001".parse().unwrap();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        let peer3 = PeerId::random();
+
+        // 1st vote
+        let res1 = record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            addr.clone(),
+            peer1,
+        );
+        assert!(res1.is_none());
+        assert_eq!(quorum_map.len(), 1);
+        assert_eq!(quorum_map.get(&addr).unwrap().len(), 1);
+
+        // Duplicate vote from peer1 (should not increment distinct count)
+        let res1_dup = record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            addr.clone(),
+            peer1,
+        );
+        assert!(res1_dup.is_none());
+        assert_eq!(quorum_map.get(&addr).unwrap().len(), 1);
+
+        // 2nd vote
+        let res2 = record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            addr.clone(),
+            peer2,
+        );
+        assert!(res2.is_none());
+        assert_eq!(quorum_map.get(&addr).unwrap().len(), 2);
+
+        // 3rd vote reaches quorum threshold
+        let res3 = record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            addr.clone(),
+            peer3,
+        );
+        assert!(res3.is_some());
+        let (confirmed_addr, count) = res3.unwrap();
+        assert_eq!(confirmed_addr, addr);
+        assert_eq!(count, 3);
+
+        // Memory cleanup: candidate must be removed from quorum_map and added to known_addrs
+        assert!(!quorum_map.contains_key(&addr));
+        assert!(known_addrs.contains(&addr));
+
+        // Subsequent votes for already confirmed address should be ignored
+        let peer4 = PeerId::random();
+        let res4 = record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            addr.clone(),
+            peer4,
+        );
+        assert!(res4.is_none());
+        assert!(!quorum_map.contains_key(&addr));
+    }
+
+    #[test]
+    fn test_observed_candidates_quorum_capacity_eviction() {
+        let mut quorum_map: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
+        let mut known_addrs: HashSet<Multiaddr> = HashSet::new();
+
+        // Fill quorum_map up to MAX_OBSERVED_CANDIDATES
+        for i in 0..MAX_OBSERVED_CANDIDATES {
+            let addr: Multiaddr = format!("/ip4/198.51.100.{}/tcp/4001", (i % 250) + 1)
+                .parse()
+                .unwrap();
+            let peer = PeerId::random();
+            record_observed_candidate_address(&mut quorum_map, &mut known_addrs, addr, peer);
+        }
+
+        assert_eq!(quorum_map.len(), MAX_OBSERVED_CANDIDATES);
+
+        // Add 2 votes for candidate 0 so it has higher weight
+        let favored_addr: Multiaddr = "/ip4/198.51.100.1/tcp/4001".parse().unwrap();
+        let peer_extra = PeerId::random();
+        record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            favored_addr.clone(),
+            peer_extra,
+        );
+        assert_eq!(quorum_map.get(&favored_addr).unwrap().len(), 2);
+
+        // Insert a brand new candidate exceeding capacity
+        let new_addr: Multiaddr = "/ip4/203.0.113.50/tcp/4001".parse().unwrap();
+        let new_peer = PeerId::random();
+        record_observed_candidate_address(
+            &mut quorum_map,
+            &mut known_addrs,
+            new_addr.clone(),
+            new_peer,
+        );
+
+        // Total size must remain bounded at MAX_OBSERVED_CANDIDATES
+        assert_eq!(quorum_map.len(), MAX_OBSERVED_CANDIDATES);
+        assert!(quorum_map.contains_key(&new_addr));
+        // Favored address with 2 votes should not have been evicted
+        assert!(quorum_map.contains_key(&favored_addr));
     }
 }

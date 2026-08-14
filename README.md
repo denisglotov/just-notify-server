@@ -17,8 +17,9 @@ IPC interface for CLI inspection and queries.
   as routing tables populate, with periodic re-announcements and re-publishing upon bootstrap completion.
 - 🎯 **Dynamic Provider Address Resolution**: Resolves multiaddresses and IP addresses for discovered DHT providers via
   `get_closest_peers` walks and `Identify` protocol events.
-- 🛡️ **Address Normalization & Anti-Pollution**: Normalizes observed external addresses to match actual listening ports
-  (`tcp_port`, `quic_port`), preventing ephemeral port explosion.
+- 🛡️ **Address Normalization & Quorum Consensus**: Normalizes observed external addresses to match actual listening ports
+  (`tcp_port`, `quic_port`), filters non-routable private/bogon IPs, and requires quorum verification across distinct peers
+  with bounded memory management before advertising public external addresses.
 - 🔑 **Persistent Node Identity**: Supports `--key-file` to save and load ed25519 identity keypairs across restarts,
   avoiding orphan provider records on the DHT.
 - 🔗 **Direct Peering & Custom Bootstrap**: Supports `--bootstrap-node` for direct multi-node peering on local networks
@@ -265,7 +266,7 @@ Both Node 1 and Node 2 will be immediately resolved with their respective multia
 ### Run Unit Tests
 
 ```bash
-cargo test --bin just-notify-server --lib
+cargo test --bin just-notify-server
 ```
 
 ### Run Formatting & Lints
