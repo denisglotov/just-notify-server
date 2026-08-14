@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_ESTABLISHED_CONNS: u32 = 100;
 pub const DEFAULT_MAX_ESTABLISHED_PER_PEER: u32 = 3;
 pub const DEFAULT_MAX_PENDING_INCOMING_CONNS: u32 = 64;
 pub const DEFAULT_MAX_PENDING_OUTGOING_CONNS: u32 = 64;
+pub const DEFAULT_MAX_PROVIDED_KEYS: usize = 65_536;
 
 #[derive(Parser, Debug)]
 #[command(name = "just-notify-server")]
@@ -77,6 +78,10 @@ pub enum Commands {
         /// Maximum pending outgoing connections
         #[arg(long, default_value_t = DEFAULT_MAX_PENDING_OUTGOING_CONNS)]
         max_pending_outgoing_connections: u32,
+
+        /// Maximum number of provider keys stored in memory DHT store
+        #[arg(long, default_value_t = DEFAULT_MAX_PROVIDED_KEYS)]
+        max_provided_keys: usize,
     },
 
     /// Search IPFS mainnet DHT for providers of a service or CID

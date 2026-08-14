@@ -68,6 +68,7 @@ pub struct DaemonConfig {
     pub max_connections_per_peer: u32,
     pub max_pending_incoming_connections: u32,
     pub max_pending_outgoing_connections: u32,
+    pub max_provided_keys: usize,
 }
 
 #[derive(Default)]
@@ -173,6 +174,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         config.max_pending_incoming_connections,
         config.max_pending_outgoing_connections
     );
+    info!(
+        "Kademlia DHT store capacity: max_provided_keys={}",
+        config.max_provided_keys
+    );
 
     // Build swarm with TCP + DNS + QUIC transports
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -188,7 +193,12 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             let peer_id = key.public().to_peer_id();
 
             // Kademlia store & config
-            let store = kad::store::MemoryStore::new(peer_id);
+            let store_config = kad::store::MemoryStoreConfig {
+                max_provided_keys: config.max_provided_keys,
+                max_records: 10_000,
+                ..Default::default()
+            };
+            let store = kad::store::MemoryStore::with_config(peer_id, store_config);
             let mut kad_config = kad::Config::default();
             kad_config.set_query_timeout(Duration::from_secs(30));
             if let Some(replication) = std::num::NonZeroUsize::new(20) {
@@ -1181,6 +1191,7 @@ mod tests {
                 max_connections_per_peer: 3,
                 max_pending_incoming_connections: 64,
                 max_pending_outgoing_connections: 64,
+                max_provided_keys: 65_536,
             };
             let res = run_daemon(config).await;
             if let Err(e) = res {
@@ -1492,5 +1503,17 @@ mod tests {
             .with_max_pending_incoming(Some(16))
             .with_max_pending_outgoing(Some(16));
         let _behaviour = connection_limits::Behaviour::new(limits);
+    }
+
+    #[test]
+    fn test_memory_store_capacity_configuration() {
+        let peer_id = PeerId::random();
+        let store_config = kad::store::MemoryStoreConfig {
+            max_provided_keys: 65_536,
+            max_records: 10_000,
+            ..Default::default()
+        };
+        let store = kad::store::MemoryStore::with_config(peer_id, store_config);
+        assert_eq!(store.provided().count(), 0);
     }
 }

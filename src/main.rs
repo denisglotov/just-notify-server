@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections_per_peer,
             max_pending_incoming_connections,
             max_pending_outgoing_connections,
+            max_provided_keys,
         } => {
             let config = daemon::DaemonConfig {
                 tcp_port,
@@ -50,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
                 max_connections_per_peer,
                 max_pending_incoming_connections,
                 max_pending_outgoing_connections,
+                max_provided_keys,
             };
             daemon::run_daemon(config).await?;
         }
