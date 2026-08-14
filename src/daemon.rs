@@ -339,11 +339,14 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         config.service_name, service_cid
     );
 
-    // Progressive re-announcement delays for initial warmup: 3s, 10s, 30s, 60s, 120s
-    let progressive_delays = [3, 10, 30, 60, 120];
-    let mut progressive_idx = 0;
-    let mut next_reannounce =
-        tokio::time::Instant::now() + Duration::from_secs(progressive_delays[0]);
+    // Initial provider record announcement (Kademlia built-in publication handles periodic re-announcements)
+    if let Err(e) = swarm
+        .behaviour_mut()
+        .kademlia
+        .start_providing(record_key.clone())
+    {
+        debug!("Initial start_providing query error: {:?}", e);
+    }
 
     let mut state = DaemonState::default();
 
@@ -373,22 +376,6 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             } => {
                 info!("Received SIGTERM, shutting down daemon...");
                 break;
-            }
-
-            // Progressive and periodic service re-announcements
-            _ = tokio::time::sleep_until(next_reannounce) => {
-                info!("Announcing service '{}' provider record to IPFS DHT", config.service_name);
-                if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(record_key.clone()) {
-                    debug!("Provider announcement query error: {:?}", e);
-                }
-
-                // Calculate next reannounce time
-                if progressive_idx + 1 < progressive_delays.len() {
-                    progressive_idx += 1;
-                    next_reannounce = tokio::time::Instant::now() + Duration::from_secs(progressive_delays[progressive_idx]);
-                } else {
-                    next_reannounce = tokio::time::Instant::now() + config.reannounce_interval;
-                }
             }
 
             // IPC commands from client
@@ -1590,8 +1577,14 @@ mod tests {
 
         // Verify raw address was removed and normalized address was added
         let ext_addrs: Vec<Multiaddr> = swarm.external_addresses().cloned().collect();
-        assert!(!ext_addrs.contains(&raw_addr), "Raw address must be removed from swarm");
-        assert!(ext_addrs.contains(&normalized_addr), "Normalized address must be added to swarm");
+        assert!(
+            !ext_addrs.contains(&raw_addr),
+            "Raw address must be removed from swarm"
+        );
+        assert!(
+            ext_addrs.contains(&normalized_addr),
+            "Normalized address must be added to swarm"
+        );
         assert!(state.known_external_addrs.contains(&normalized_addr));
 
         // Fire ExternalAddrExpired
@@ -1601,7 +1594,10 @@ mod tests {
         handle_swarm_event(expire_event, &mut swarm, &mut state, &record_key, &config);
 
         let ext_addrs_after: Vec<Multiaddr> = swarm.external_addresses().cloned().collect();
-        assert!(!ext_addrs_after.contains(&normalized_addr), "Normalized address must be removed on expiry");
+        assert!(
+            !ext_addrs_after.contains(&normalized_addr),
+            "Normalized address must be removed on expiry"
+        );
         assert!(!state.known_external_addrs.contains(&normalized_addr));
 
         // Verify unroutable / private address is removed and not added as external
@@ -1612,6 +1608,9 @@ mod tests {
             address: private_addr.clone(),
         };
         handle_swarm_event(event_private, &mut swarm, &mut state, &record_key, &config);
-        assert!(!swarm.external_addresses().any(|a| a == &private_addr), "Private address must be removed from swarm");
+        assert!(
+            !swarm.external_addresses().any(|a| a == &private_addr),
+            "Private address must be removed from swarm"
+        );
     }
 }
