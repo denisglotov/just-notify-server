@@ -207,7 +207,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             if let Some(replication) = std::num::NonZeroUsize::new(20) {
                 kad_config.set_replication_factor(replication);
             }
-            kad_config.set_provider_publication_interval(Some(config.reannounce_interval));
+            kad_config.set_provider_publication_interval(None);
             let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
 
@@ -356,6 +356,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    let mut current_reannounce_interval = Duration::from_secs(5);
+    let max_reannounce_interval = config.reannounce_interval;
+    let mut reannounce_timer = Box::pin(tokio::time::sleep(current_reannounce_interval));
+
     info!("Daemon running. Awaiting network events and IPC client commands...");
 
     loop {
@@ -438,6 +442,21 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                     &record_key,
                     &config,
                 );
+            }
+
+            // Periodic Kademlia DHT re-announcement to refresh local provider TTL
+            _ = &mut reannounce_timer => {
+                debug!("Periodic reannouncement: providing Kademlia record");
+                if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(record_key.clone()) {
+                    warn!("Periodic start_providing error: {:?}", e);
+                }
+
+                // Exponential backoff until we hit the max interval
+                current_reannounce_interval = std::cmp::min(
+                    current_reannounce_interval * 2,
+                    max_reannounce_interval,
+                );
+                reannounce_timer.as_mut().reset(tokio::time::Instant::now() + current_reannounce_interval);
             }
         }
     }
