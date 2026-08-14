@@ -6,6 +6,7 @@ mod service_key;
 
 use crate::cli::{Cli, Commands};
 use crate::ipc::{send_ipc_request, IpcRequest, IpcResponse};
+use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -42,29 +43,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             let req = IpcRequest::try_from(cmd).expect("Non-daemon commands convert to IpcRequest");
-            handle_ipc_result(send_ipc_request(&socket_path, &req).await);
+            match send_ipc_request(&socket_path, &req).await? {
+                IpcResponse::Success { data } => {
+                    let json = serde_json::to_string_pretty(&data)
+                        .context("Failed to format response JSON")?;
+                    println!("{}", json);
+                }
+                IpcResponse::Error { message } => {
+                    anyhow::bail!("Daemon returned error: {}", message);
+                }
+            }
         }
     }
 
     Ok(())
-}
-
-fn handle_ipc_result(result: anyhow::Result<IpcResponse>) {
-    match result {
-        Ok(IpcResponse::Success { data }) => match serde_json::to_string_pretty(&data) {
-            Ok(json) => println!("{}", json),
-            Err(e) => {
-                eprintln!("Failed to format response JSON: {}", e);
-                std::process::exit(1);
-            }
-        },
-        Ok(IpcResponse::Error { message }) => {
-            eprintln!("Daemon returned error: {}", message);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("IPC Error: {}", e);
-            std::process::exit(1);
-        }
-    }
 }
