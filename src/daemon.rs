@@ -731,7 +731,9 @@ fn handle_swarm_event(
                 normalize_observed_address(&address, config.tcp_port, config.quic_port)
             {
                 state.observed_candidates_quorum.remove(&clean_addr);
-                if state.known_external_addrs.insert(clean_addr.clone()) {
+                let is_new = state.known_external_addrs.insert(clean_addr.clone());
+                swarm.add_external_address(clean_addr.clone());
+                if is_new {
                     info!("Confirmed external public address: {}", clean_addr);
                     if let Err(e) = swarm
                         .behaviour_mut()
@@ -741,7 +743,6 @@ fn handle_swarm_event(
                         debug!("Start providing on external address confirmation: {:?}", e);
                     }
                 }
-                swarm.add_external_address(clean_addr);
             }
         }
         libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
