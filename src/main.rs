@@ -32,6 +32,10 @@ async fn main() -> anyhow::Result<()> {
             bootstrap_nodes_file,
             bootstrap_nodes,
             key_file,
+            max_connections,
+            max_connections_per_peer,
+            max_pending_incoming_connections,
+            max_pending_outgoing_connections,
         } => {
             let config = daemon::DaemonConfig {
                 tcp_port,
@@ -42,6 +46,10 @@ async fn main() -> anyhow::Result<()> {
                 bootstrap_nodes_file,
                 cli_bootstrap_nodes: bootstrap_nodes,
                 key_file,
+                max_connections,
+                max_connections_per_peer,
+                max_pending_incoming_connections,
+                max_pending_outgoing_connections,
             };
             daemon::run_daemon(config).await?;
         }

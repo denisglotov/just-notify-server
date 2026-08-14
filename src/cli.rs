@@ -9,6 +9,10 @@ pub const DEFAULT_TCP_PORT: u16 = 4001;
 pub const DEFAULT_QUIC_PORT: u16 = 4001;
 pub const DEFAULT_REANNOUNCE_INTERVAL_SECS: u64 = 1800;
 pub const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_ESTABLISHED_CONNS: u32 = 100;
+pub const DEFAULT_MAX_ESTABLISHED_PER_PEER: u32 = 3;
+pub const DEFAULT_MAX_PENDING_INCOMING_CONNS: u32 = 64;
+pub const DEFAULT_MAX_PENDING_OUTGOING_CONNS: u32 = 64;
 
 #[derive(Parser, Debug)]
 #[command(name = "just-notify-server")]
@@ -57,6 +61,22 @@ pub enum Commands {
         /// Path to ed25519 identity key file to persist node Peer ID across restarts
         #[arg(long, default_value = DEFAULT_KEY_FILE)]
         key_file: PathBuf,
+
+        /// Maximum total established peer connections
+        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_CONNS)]
+        max_connections: u32,
+
+        /// Maximum established connections per individual peer
+        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_PER_PEER)]
+        max_connections_per_peer: u32,
+
+        /// Maximum pending incoming connections
+        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_INCOMING_CONNS)]
+        max_pending_incoming_connections: u32,
+
+        /// Maximum pending outgoing connections
+        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_OUTGOING_CONNS)]
+        max_pending_outgoing_connections: u32,
     },
 
     /// Search IPFS mainnet DHT for providers of a service or CID

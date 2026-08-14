@@ -1424,6 +1424,7 @@ dependencies = [
  "clap",
  "futures",
  "libp2p",
+ "libp2p-connection-limits",
  "multihash",
  "serde",
  "serde_json",

@@ -16,6 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{debug, info, warn};
 
+use libp2p_connection_limits as connection_limits;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProvider {
     pub peer_id: String,
@@ -62,6 +64,10 @@ pub struct DaemonConfig {
     pub bootstrap_nodes_file: PathBuf,
     pub cli_bootstrap_nodes: Vec<String>,
     pub key_file: PathBuf,
+    pub max_connections: u32,
+    pub max_connections_per_peer: u32,
+    pub max_pending_incoming_connections: u32,
+    pub max_pending_outgoing_connections: u32,
 }
 
 #[derive(Default)]
@@ -160,6 +166,14 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     info!("Local Peer ID: {}", local_peer_id);
     info!("Node identity persisted at: {}", config.key_file.display());
 
+    info!(
+        "Connection limits: max_established={}, max_per_peer={}, max_pending_incoming={}, max_pending_outgoing={}",
+        config.max_connections,
+        config.max_connections_per_peer,
+        config.max_pending_incoming_connections,
+        config.max_pending_outgoing_connections
+    );
+
     // Build swarm with TCP + DNS + QUIC transports
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -196,11 +210,20 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             // AutoNAT
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
 
+            // Connection Limits
+            let limits = connection_limits::ConnectionLimits::default()
+                .with_max_established(Some(config.max_connections))
+                .with_max_established_per_peer(Some(config.max_connections_per_peer))
+                .with_max_pending_incoming(Some(config.max_pending_incoming_connections))
+                .with_max_pending_outgoing(Some(config.max_pending_outgoing_connections));
+            let connection_limits = connection_limits::Behaviour::new(limits);
+
             Ok(AppBehaviour {
                 kademlia,
                 identify,
                 ping,
                 autonat,
+                connection_limits,
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -776,6 +799,17 @@ fn handle_swarm_event(
         libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             debug!("Outgoing connection error to {:?}: {:?}", peer_id, error);
         }
+        libp2p::swarm::SwarmEvent::IncomingConnectionError {
+            local_addr,
+            send_back_addr,
+            error,
+            ..
+        } => {
+            debug!(
+                "Incoming connection error from {} on {}: {:?}",
+                send_back_addr, local_addr, error
+            );
+        }
         libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             debug!("Connection closed with peer {}: {:?}", peer_id, cause);
         }
@@ -1143,6 +1177,10 @@ mod tests {
                         .to_string(),
                 ],
                 key_file: key_clone,
+                max_connections: 100,
+                max_connections_per_peer: 3,
+                max_pending_incoming_connections: 64,
+                max_pending_outgoing_connections: 64,
             };
             let res = run_daemon(config).await;
             if let Err(e) = res {
@@ -1444,5 +1482,15 @@ mod tests {
         assert_eq!(search_val["service"], "test-srv");
         assert_eq!(search_val["providers"][0]["peer_id"], "12D3KooWProvider");
         assert!(search_val.get("timed_out").is_none());
+    }
+
+    #[test]
+    fn test_connection_limits_configuration() {
+        let limits = connection_limits::ConnectionLimits::default()
+            .with_max_established(Some(50))
+            .with_max_established_per_peer(Some(2))
+            .with_max_pending_incoming(Some(16))
+            .with_max_pending_outgoing(Some(16));
+        let _behaviour = connection_limits::Behaviour::new(limits);
     }
 }
