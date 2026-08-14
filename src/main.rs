@@ -21,11 +21,12 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
+    let socket_path = cli.socket_path;
+
     match cli.command {
         Commands::Daemon {
             tcp_port,
             quic_port,
-            socket_path,
             service_name,
             reannounce_interval,
             bootstrap_nodes_file,
@@ -47,7 +48,6 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Search {
             service_name,
-            socket_path,
             timeout,
         } => {
             println!(
@@ -63,12 +63,12 @@ async fn main() -> anyhow::Result<()> {
             handle_ipc_result(send_ipc_request(&socket_path, &req).await);
         }
 
-        Commands::Peers { socket_path } => {
+        Commands::Peers => {
             let req = IpcRequest::Peers;
             handle_ipc_result(send_ipc_request(&socket_path, &req).await);
         }
 
-        Commands::Info { socket_path } => {
+        Commands::Info => {
             let req = IpcRequest::Info;
             handle_ipc_result(send_ipc_request(&socket_path, &req).await);
         }
