@@ -164,7 +164,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     info!("Starting IPFS libp2p server daemon...");
 
     // Load or generate identity keypair
-    let local_key = service_key::load_or_generate_keypair(Some(&config.key_file))?;
+    let local_key = service_key::load_or_generate_keypair(&config.key_file)?;
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local Peer ID: {}", local_peer_id);
     info!("Node identity persisted at: {}", config.key_file.display());
@@ -351,8 +351,6 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     }
 
     let mut state = DaemonState::default();
-
-    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut current_reannounce_interval = Duration::from_secs(5);
@@ -370,16 +368,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             }
 
             // Shutdown on SIGTERM
-            _ = async {
-                #[cfg(unix)]
-                {
-                    sigterm.recv().await;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down daemon...");
                 break;
             }

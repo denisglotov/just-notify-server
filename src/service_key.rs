@@ -1,6 +1,8 @@
 use cid::Cid;
 use multihash::Multihash;
 use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::str::FromStr;
 
 /// Derives a deterministic Multihash and CID from a service name or CID string.
@@ -180,57 +182,40 @@ pub fn normalize_observed_address(
 }
 
 /// Loads a keypair from a file if it exists, or generates a new ed25519 keypair and saves it.
-/// If no path is provided, a new in-memory ed25519 keypair is generated.
 pub fn load_or_generate_keypair(
-    key_path: Option<&std::path::Path>,
+    key_path: &std::path::Path,
 ) -> anyhow::Result<libp2p::identity::Keypair> {
-    if let Some(path) = key_path {
-        if path.exists() {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("Failed to read keypair file at '{}'", path.display()))?;
-            let keypair =
-                libp2p::identity::Keypair::from_protobuf_encoding(&bytes).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to decode keypair from '{}': {:?}",
-                        path.display(),
-                        e
-                    )
-                })?;
-            return Ok(keypair);
-        }
-
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
-        let bytes = keypair
-            .to_protobuf_encoding()
-            .map_err(|e| anyhow::anyhow!("Failed to encode generated keypair: {:?}", e))?;
-
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true).mode(0o600);
-            let mut file = options.open(path).with_context(|| {
-                format!("Failed to create keypair file at '{}'", path.display())
-            })?;
-            file.write_all(&bytes)
-                .with_context(|| format!("Failed to write keypair file at '{}'", path.display()))?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, &bytes)
-                .with_context(|| format!("Failed to save keypair file to '{}'", path.display()))?;
-        }
-
-        Ok(keypair)
-    } else {
-        Ok(libp2p::identity::Keypair::generate_ed25519())
+    if key_path.exists() {
+        let bytes = std::fs::read(key_path)
+            .with_context(|| format!("Failed to read keypair file at '{}'", key_path.display()))?;
+        let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to decode keypair from '{}': {:?}",
+                key_path.display(),
+                e
+            )
+        })?;
+        return Ok(keypair);
     }
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let bytes = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow::anyhow!("Failed to encode generated keypair: {:?}", e))?;
+
+    if let Some(parent) = key_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = options
+        .open(key_path)
+        .with_context(|| format!("Failed to create keypair file at '{}'", key_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("Failed to write keypair file at '{}'", key_path.display()))?;
+
+    Ok(keypair)
 }
 
 #[cfg(test)]
@@ -425,10 +410,10 @@ mod tests {
             std::time::SystemTime::now().elapsed().unwrap().as_nanos()
         ));
 
-        let kp1 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let kp1 = load_or_generate_keypair(&key_file).unwrap();
         let peer_id1 = libp2p::PeerId::from(kp1.public());
 
-        let kp2 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let kp2 = load_or_generate_keypair(&key_file).unwrap();
         let peer_id2 = libp2p::PeerId::from(kp2.public());
 
         assert_eq!(peer_id1, peer_id2);
