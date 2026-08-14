@@ -25,12 +25,16 @@ pub struct DiscoveredProvider {
 struct PendingSearch {
     providers: Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
     sender: oneshot::Sender<Vec<DiscoveredProvider>>,
+    deadline: std::time::Instant,
 }
 
 enum DaemonEvent {
     Ipc {
         request: IpcRequest,
         responder: oneshot::Sender<IpcResponse>,
+    },
+    SearchTimeout {
+        query_id: kad::QueryId,
     },
 }
 
@@ -326,7 +330,13 @@ pub async fn run_daemon(
                             local_peer_id,
                             &service_name,
                             &mut pending_searches,
+                            ipc_tx.clone(),
                         );
+                    }
+                    Some(DaemonEvent::SearchTimeout { query_id }) => {
+                        if pending_searches.remove(&query_id).is_some() {
+                            debug!("Cleaned up timed-out search query {:?}", query_id);
+                        }
                     }
                     None => {
                         warn!("IPC receiver stream closed");
@@ -425,6 +435,7 @@ fn handle_ipc_request(
     local_peer_id: PeerId,
     daemon_service_name: &str,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
+    daemon_event_tx: mpsc::Sender<DaemonEvent>,
 ) {
     match request {
         IpcRequest::Info => {
@@ -519,6 +530,8 @@ fn handle_ipc_request(
                 initial_providers.len()
             );
 
+            let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(30));
+            let deadline = std::time::Instant::now() + timeout_duration;
             let (search_tx, search_rx) = oneshot::channel::<Vec<DiscoveredProvider>>();
             let shared_providers = Arc::new(Mutex::new(initial_providers));
             pending_searches.insert(
@@ -526,11 +539,12 @@ fn handle_ipc_request(
                 PendingSearch {
                     providers: shared_providers.clone(),
                     sender: search_tx,
+                    deadline,
                 },
             );
 
-            let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(30));
             let timeout_providers = shared_providers.clone();
+            let event_tx = daemon_event_tx.clone();
 
             // Spawn timeout task to complete search if DHT query finishes or times out
             tokio::spawn(async move {
@@ -544,6 +558,7 @@ fn handle_ipc_request(
                         }),
                     },
                     Ok(Err(_)) => {
+                        let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
                         let providers = format_provider_results(&timeout_providers);
                         IpcResponse::Success {
                             data: serde_json::json!({
@@ -554,6 +569,7 @@ fn handle_ipc_request(
                         }
                     }
                     Err(_) => {
+                        let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
                         let providers = format_provider_results(&timeout_providers);
                         if !providers.is_empty() {
                             IpcResponse::Success {
@@ -901,11 +917,16 @@ fn handle_kademlia_event(
 }
 
 fn update_pending_searches_for_peer(
-    pending_searches: &HashMap<kad::QueryId, PendingSearch>,
+    pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
     peer: &PeerId,
     new_addrs: &[Multiaddr],
 ) {
-    if new_addrs.is_empty() || pending_searches.is_empty() {
+    if pending_searches.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    pending_searches.retain(|_, search| search.deadline > now);
+    if new_addrs.is_empty() {
         return;
     }
     pending_searches.values().for_each(|search| {
@@ -1086,5 +1107,49 @@ mod tests {
         daemon_handle.abort();
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&key_file);
+    }
+
+    #[test]
+    fn test_pending_search_timeout_eviction() {
+        let mut pending_searches = HashMap::new();
+        let peer_id = PeerId::random();
+        let store = kad::store::MemoryStore::new(peer_id);
+        let mut kademlia = kad::Behaviour::new(peer_id, store);
+
+        let dummy_qid1 = kademlia.get_closest_peers(PeerId::random());
+        let dummy_qid2 = kademlia.get_closest_peers(PeerId::random());
+
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+
+        // Query 1 expired 1 second ago
+        pending_searches.insert(
+            dummy_qid1,
+            PendingSearch {
+                providers: Arc::new(Mutex::new(HashMap::new())),
+                sender: tx1,
+                deadline: std::time::Instant::now() - Duration::from_secs(1),
+            },
+        );
+
+        // Query 2 expires in 60 seconds
+        pending_searches.insert(
+            dummy_qid2,
+            PendingSearch {
+                providers: Arc::new(Mutex::new(HashMap::new())),
+                sender: tx2,
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        assert_eq!(pending_searches.len(), 2);
+
+        // Calling update_pending_searches_for_peer should evict query 1 and retain query 2
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        update_pending_searches_for_peer(&mut pending_searches, &peer_id, &[addr]);
+
+        assert_eq!(pending_searches.len(), 1);
+        assert!(pending_searches.contains_key(&dummy_qid2));
+        assert!(!pending_searches.contains_key(&dummy_qid1));
     }
 }
