@@ -46,30 +46,20 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Search {
-            service_name,
-            timeout,
-        } => {
-            println!(
-                "Querying daemon at {} for service '{}' (timeout: {}s)...",
-                socket_path.display(),
-                service_name,
-                timeout
-            );
-            let req = IpcRequest::Search {
-                service_name,
-                timeout_secs: Some(timeout),
-            };
-            handle_ipc_result(send_ipc_request(&socket_path, &req).await);
-        }
-
-        Commands::Peers => {
-            let req = IpcRequest::Peers;
-            handle_ipc_result(send_ipc_request(&socket_path, &req).await);
-        }
-
-        Commands::Info => {
-            let req = IpcRequest::Info;
+        cmd => {
+            if let Commands::Search {
+                ref service_name,
+                timeout,
+            } = cmd
+            {
+                println!(
+                    "Querying daemon at {} for service '{}' (timeout: {}s)...",
+                    socket_path.display(),
+                    service_name,
+                    timeout
+                );
+            }
+            let req = IpcRequest::try_from(cmd).expect("Non-daemon commands convert to IpcRequest");
             handle_ipc_result(send_ipc_request(&socket_path, &req).await);
         }
     }

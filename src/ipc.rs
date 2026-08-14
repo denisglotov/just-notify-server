@@ -4,6 +4,8 @@ use std::path::Path;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
+use crate::cli::Commands;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum IpcRequest {
@@ -14,6 +16,25 @@ pub enum IpcRequest {
     },
     Peers,
     Info,
+}
+
+impl TryFrom<Commands> for IpcRequest {
+    type Error = Commands;
+
+    fn try_from(cmd: Commands) -> Result<Self, Self::Error> {
+        match cmd {
+            Commands::Search {
+                service_name,
+                timeout,
+            } => Ok(IpcRequest::Search {
+                service_name,
+                timeout_secs: Some(timeout),
+            }),
+            Commands::Peers => Ok(IpcRequest::Peers),
+            Commands::Info => Ok(IpcRequest::Info),
+            daemon @ Commands::Daemon { .. } => Err(daemon),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,5 +122,27 @@ mod tests {
             }
             _ => panic!("Expected Search variant"),
         }
+    }
+
+    #[test]
+    fn test_ipc_request_from_commands() {
+        let search_cmd = Commands::Search {
+            service_name: "test-srv".to_string(),
+            timeout: 15,
+        };
+        let req = IpcRequest::try_from(search_cmd).unwrap();
+        assert!(matches!(
+            req,
+            IpcRequest::Search {
+                service_name,
+                timeout_secs: Some(15),
+            } if service_name == "test-srv"
+        ));
+
+        let peers_req = IpcRequest::try_from(Commands::Peers).unwrap();
+        assert!(matches!(peers_req, IpcRequest::Peers));
+
+        let info_req = IpcRequest::try_from(Commands::Info).unwrap();
+        assert!(matches!(info_req, IpcRequest::Info));
     }
 }
