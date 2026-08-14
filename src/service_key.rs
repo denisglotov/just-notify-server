@@ -143,45 +143,57 @@ pub fn normalize_observed_address(
     tcp_port: u16,
     quic_port: u16,
 ) -> Option<libp2p::Multiaddr> {
-    let mut ip_part = None;
+    use libp2p::multiaddr::Protocol;
+
+    let mut host_protocol = None;
     let mut is_quic = false;
     let mut is_tcp = false;
 
     for proto in observed.iter() {
         match proto {
-            libp2p::multiaddr::Protocol::Ip4(ip) => {
+            Protocol::Ip4(ip) => {
                 if is_public_routable_ipv4(&ip) {
-                    ip_part = Some(format!("/ip4/{}", ip));
+                    host_protocol = Some(Protocol::Ip4(ip));
                 }
             }
-            libp2p::multiaddr::Protocol::Ip6(ip) => {
+            Protocol::Ip6(ip) => {
                 if is_public_routable_ipv6(&ip) {
-                    ip_part = Some(format!("/ip6/{}", ip));
+                    host_protocol = Some(Protocol::Ip6(ip));
                 }
             }
-            libp2p::multiaddr::Protocol::Dns(dns)
-            | libp2p::multiaddr::Protocol::Dns4(dns)
-            | libp2p::multiaddr::Protocol::Dns6(dns)
-            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => {
-                if dns != "localhost" && dns.contains('.') {
-                    ip_part = Some(format!("/dns4/{}", dns));
-                }
+            Protocol::Dns(dns) if dns != "localhost" && dns.contains('.') => {
+                host_protocol = Some(Protocol::Dns(dns));
             }
-            libp2p::multiaddr::Protocol::QuicV1 => {
+            Protocol::Dns4(dns) if dns != "localhost" && dns.contains('.') => {
+                host_protocol = Some(Protocol::Dns4(dns));
+            }
+            Protocol::Dns6(dns) if dns != "localhost" && dns.contains('.') => {
+                host_protocol = Some(Protocol::Dns6(dns));
+            }
+            Protocol::Dnsaddr(dns) if dns != "localhost" && dns.contains('.') => {
+                host_protocol = Some(Protocol::Dnsaddr(dns));
+            }
+            Protocol::QuicV1 => {
                 is_quic = true;
             }
-            libp2p::multiaddr::Protocol::Tcp(_) => {
+            Protocol::Tcp(_) => {
                 is_tcp = true;
             }
             _ => {}
         }
     }
 
-    let base = ip_part?;
+    let host = host_protocol?;
+    let mut normalized = libp2p::Multiaddr::empty();
+    normalized.push(host);
+
     if is_quic {
-        format!("{}/udp/{}/quic-v1", base, quic_port).parse().ok()
+        normalized.push(Protocol::Udp(quic_port));
+        normalized.push(Protocol::QuicV1);
+        Some(normalized)
     } else if is_tcp {
-        format!("{}/tcp/{}", base, tcp_port).parse().ok()
+        normalized.push(Protocol::Tcp(tcp_port));
+        Some(normalized)
     } else {
         None
     }
@@ -291,6 +303,43 @@ mod tests {
         assert_eq!(
             normalized.to_string(),
             "/ip4/136.169.50.80/udp/4002/quic-v1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_observed_address_ipv6() {
+        let observed: libp2p::Multiaddr = "/ip6/2600:1900::1/tcp/54358".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4001).unwrap();
+        assert_eq!(normalized.to_string(), "/ip6/2600:1900::1/tcp/4001");
+    }
+
+    #[test]
+    fn test_normalize_observed_address_dns_protocols() {
+        let obs_dns4: libp2p::Multiaddr = "/dns4/bootstrap.libp2p.io/tcp/54358".parse().unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dns4, 4001, 4001)
+                .unwrap()
+                .to_string(),
+            "/dns4/bootstrap.libp2p.io/tcp/4001"
+        );
+
+        let obs_dns6: libp2p::Multiaddr = "/dns6/bootstrap.libp2p.io/udp/1234/quic-v1"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dns6, 4001, 4002)
+                .unwrap()
+                .to_string(),
+            "/dns6/bootstrap.libp2p.io/udp/4002/quic-v1"
+        );
+
+        let obs_dnsaddr: libp2p::Multiaddr =
+            "/dnsaddr/bootstrap.libp2p.io/tcp/9999".parse().unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dnsaddr, 4001, 4001)
+                .unwrap()
+                .to_string(),
+            "/dnsaddr/bootstrap.libp2p.io/tcp/4001"
         );
     }
 
