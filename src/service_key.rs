@@ -1,9 +1,13 @@
+use anyhow::Context;
 use cid::Cid;
 use multihash::Multihash;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::str::FromStr;
+
+pub const SHA2_256_CODE: u64 = 0x12;
+pub const RAW_CODEC: u64 = 0x55;
 
 /// Derives a deterministic Multihash and CID from a service name or CID string.
 /// If the input string is already a valid CID, it returns the parsed CID and its multihash.
@@ -20,12 +24,10 @@ pub fn derive_service_multihash(input: &str) -> (Cid, Multihash<64>) {
     // Otherwise compute SHA-256 digest of string
     let digest = Sha256::digest(input.as_bytes());
 
-    // Multihash code for SHA2-256 is 0x12
-    let mhash =
-        Multihash::<64>::wrap(0x12, &digest).expect("SHA256 multihash digest fits in 64 bytes");
+    let mhash = Multihash::<64>::wrap(SHA2_256_CODE, &digest)
+        .expect("SHA256 multihash digest fits in 64 bytes");
 
-    // CIDv1 with Raw codec (0x55)
-    let cid = Cid::new_v1(0x55, mhash);
+    let cid = Cid::new_v1(RAW_CODEC, mhash);
 
     (cid, mhash)
 }
@@ -47,79 +49,44 @@ fn is_valid_public_dns(dns: &str) -> bool {
 /// Filters out private (RFC 1918), loopback (127.0.0.0/8), link-local (169.254.0.0/16),
 /// CGNAT / Shared address space (100.64.0.0/10), documentation, benchmarking, multicast, and broadcast/unspecified.
 pub fn is_public_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    // Unspecified (0.0.0.0) or Broadcast (255.255.255.255)
-    if ip.is_unspecified() || ip.is_broadcast() {
-        return false;
-    }
-    // Loopback 127.0.0.0/8
-    if ip.is_loopback() {
-        return false;
-    }
-    // Private RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-    if ip.is_private() {
-        return false;
-    }
-    // Link-local 169.254.0.0/16
-    if ip.is_link_local() {
-        return false;
-    }
-    // Shared / CGNAT (RFC 6598): 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
-    if octets[0] == 100 && (octets[1] & 0xc0) == 64 {
-        return false;
-    }
-    // IETF Protocol Assignments: 192.0.0.0/24
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return false;
-    }
-    // Documentation (RFC 5737): 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-    if ip.is_documentation() {
-        return false;
-    }
-    // Benchmarking (RFC 2544): 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
-    if octets[0] == 198 && (octets[1] & 0xfe) == 18 {
-        return false;
-    }
-    // Direct Multicast 224.0.0.0/4 and Reserved (RFC 1112) 240.0.0.0/4
-    if ip.is_multicast() || octets[0] >= 240 {
-        return false;
-    }
-    true
+    let [o0, o1, o2, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || (o0 == 100 && (o1 & 0xc0) == 64)       // Shared / CGNAT (RFC 6598): 100.64.0.0/10
+        || (o0 == 192 && o1 == 0 && o2 == 0)      // IETF Protocol Assignments: 192.0.0.0/24
+        || (o0 == 198 && (o1 & 0xfe) == 18)      // Benchmarking (RFC 2544): 198.18.0.0/15
+        || o0 >= 240) // Reserved (RFC 1112) 240.0.0.0/4
 }
 
 /// Checks if an IPv6 address is globally routable on the public internet.
 /// Filters out unspecified (::), loopback (::1), unique local (fc00::/7),
 /// link-local (fe80::/10), documentation (2001:db8::/32), and multicast (ff00::/8).
 pub fn is_public_routable_ipv6(ip: &std::net::Ipv6Addr) -> bool {
-    let octets = ip.octets();
-    // Unspecified (::)
-    if ip.is_unspecified() {
-        return false;
-    }
-    // Loopback (::1)
-    if ip.is_loopback() {
-        return false;
-    }
-    // Multicast ff00::/8
-    if ip.is_multicast() {
-        return false;
-    }
-    // Unique Local Address (ULA) fc00::/7
-    if (octets[0] & 0xfe) == 0xfc {
-        return false;
-    }
-    // Unicast Link-Local fe80::/10
-    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
-        return false;
-    }
-    // Documentation 2001:db8::/32
-    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8 {
-        return false;
-    }
-    true
+    let [s0, s1, s2, s3, ..] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || (s0 & 0xfe) == 0xfc                     // Unique Local Address (ULA) fc00::/7
+        || (s0 == 0xfe && (s1 & 0xc0) == 0x80)    // Unicast Link-Local fe80::/10
+        || (s0 == 0x20 && s1 == 0x01 && s2 == 0x0d && s3 == 0xb8)) // Documentation 2001:db8::/32
 }
 
-use anyhow::Context;
+fn is_public_host(proto: &libp2p::multiaddr::Protocol) -> bool {
+    use libp2p::multiaddr::Protocol;
+    match proto {
+        Protocol::Ip4(ip) => is_public_routable_ipv4(*ip),
+        Protocol::Ip6(ip) => is_public_routable_ipv6(ip),
+        Protocol::Dns(dns) | Protocol::Dns4(dns) | Protocol::Dns6(dns) | Protocol::Dnsaddr(dns) => {
+            is_valid_public_dns(dns)
+        }
+        _ => false,
+    }
+}
 
 /// Normalizes an observed multiaddress from an Identify protocol message.
 /// Ephemeral outgoing ports are replaced with the node's configured listening ports.
@@ -131,41 +98,10 @@ pub fn normalize_observed_address(
 ) -> Option<libp2p::Multiaddr> {
     use libp2p::multiaddr::Protocol;
 
-    let mut host = None;
-    let mut is_quic = false;
-    let mut is_tcp = false;
+    let host = observed.iter().find(is_public_host)?;
+    let is_quic = observed.iter().any(|p| matches!(p, Protocol::QuicV1));
+    let is_tcp = observed.iter().any(|p| matches!(p, Protocol::Tcp(_)));
 
-    for proto in observed {
-        match proto {
-            Protocol::Ip4(ip) if host.is_none() && is_public_routable_ipv4(ip) => {
-                host = Some(Protocol::Ip4(ip));
-            }
-            Protocol::Ip6(ip) if host.is_none() && is_public_routable_ipv6(&ip) => {
-                host = Some(Protocol::Ip6(ip));
-            }
-            Protocol::Dns(dns) if host.is_none() && is_valid_public_dns(&dns) => {
-                host = Some(Protocol::Dns(dns));
-            }
-            Protocol::Dns4(dns) if host.is_none() && is_valid_public_dns(&dns) => {
-                host = Some(Protocol::Dns4(dns));
-            }
-            Protocol::Dns6(dns) if host.is_none() && is_valid_public_dns(&dns) => {
-                host = Some(Protocol::Dns6(dns));
-            }
-            Protocol::Dnsaddr(dns) if host.is_none() && is_valid_public_dns(&dns) => {
-                host = Some(Protocol::Dnsaddr(dns));
-            }
-            Protocol::QuicV1 => {
-                is_quic = true;
-            }
-            Protocol::Tcp(_) => {
-                is_tcp = true;
-            }
-            _ => {}
-        }
-    }
-
-    let host = host?;
     let mut normalized = libp2p::Multiaddr::empty();
     normalized.push(host);
 
@@ -204,12 +140,19 @@ pub fn load_or_generate_keypair(
         .map_err(|e| anyhow::anyhow!("Failed to encode generated keypair: {:?}", e))?;
 
     if let Some(parent) = key_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create parent directory for '{}'",
+                key_path.display()
+            )
+        })?;
     }
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
-    let mut file = options
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
         .open(key_path)
         .with_context(|| format!("Failed to create keypair file at '{}'", key_path.display()))?;
     file.write_all(&bytes)
