@@ -21,7 +21,7 @@ async fn test_daemon_stress_and_resilience() {
     let sock_clone = socket_path.clone();
     let key_clone = key_file.clone();
     let daemon_handle = tokio::spawn(async move {
-        let _ = daemon::run_daemon(
+        let res = daemon::run_daemon(
             29003,
             29003,
             sock_clone,
@@ -32,11 +32,14 @@ async fn test_daemon_stress_and_resilience() {
             key_clone,
         )
         .await;
+        if let Err(e) = res {
+            eprintln!("run_daemon returned error: {:?}", e);
+        }
     });
 
     // Wait for daemon socket to be created
     let mut ready = false;
-    for _ in 0..50 {
+    for _ in 0..100 {
         if socket_path.exists() {
             ready = true;
             break;

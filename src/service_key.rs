@@ -67,10 +67,87 @@ pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
     ip_list
 }
 
+/// Checks if an IPv4 address is globally routable on the public internet.
+/// Filters out private (RFC 1918), loopback (127.0.0.0/8), link-local (169.254.0.0/16),
+/// CGNAT / Shared address space (100.64.0.0/10), documentation, benchmarking, multicast, and broadcast/unspecified.
+pub fn is_public_routable_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // Unspecified (0.0.0.0) or Broadcast (255.255.255.255)
+    if ip.is_unspecified() || ip.is_broadcast() {
+        return false;
+    }
+    // Loopback 127.0.0.0/8
+    if ip.is_loopback() {
+        return false;
+    }
+    // Private RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    if ip.is_private() {
+        return false;
+    }
+    // Link-local 169.254.0.0/16
+    if ip.is_link_local() {
+        return false;
+    }
+    // Shared / CGNAT (RFC 6598): 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    if octets[0] == 100 && (octets[1] & 0xc0) == 64 {
+        return false;
+    }
+    // IETF Protocol Assignments: 192.0.0.0/24
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return false;
+    }
+    // Documentation (RFC 5737): 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+    if ip.is_documentation() {
+        return false;
+    }
+    // Benchmarking (RFC 2544): 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+    if octets[0] == 198 && (octets[1] & 0xfe) == 18 {
+        return false;
+    }
+    // Direct Multicast 224.0.0.0/4 and Reserved (RFC 1112) 240.0.0.0/4
+    if ip.is_multicast() || octets[0] >= 240 {
+        return false;
+    }
+    true
+}
+
+/// Checks if an IPv6 address is globally routable on the public internet.
+/// Filters out unspecified (::), loopback (::1), unique local (fc00::/7),
+/// link-local (fe80::/10), documentation (2001:db8::/32), and multicast (ff00::/8).
+pub fn is_public_routable_ipv6(ip: &std::net::Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    // Unspecified (::)
+    if ip.is_unspecified() {
+        return false;
+    }
+    // Loopback (::1)
+    if ip.is_loopback() {
+        return false;
+    }
+    // Multicast ff00::/8
+    if ip.is_multicast() {
+        return false;
+    }
+    // Unique Local Address (ULA) fc00::/7
+    if (octets[0] & 0xfe) == 0xfc {
+        return false;
+    }
+    // Unicast Link-Local fe80::/10
+    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+        return false;
+    }
+    // Documentation 2001:db8::/32
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8 {
+        return false;
+    }
+    true
+}
+
 use anyhow::Context;
 
 /// Normalizes an observed multiaddress from an Identify protocol message.
 /// Ephemeral outgoing ports are replaced with the node's configured listening ports.
+/// Only globally routable public IP addresses are accepted.
 pub fn normalize_observed_address(
     observed: &libp2p::Multiaddr,
     tcp_port: u16,
@@ -83,12 +160,12 @@ pub fn normalize_observed_address(
     for proto in observed.iter() {
         match proto {
             libp2p::multiaddr::Protocol::Ip4(ip) => {
-                if !ip.is_unspecified() && !ip.is_broadcast() {
+                if is_public_routable_ipv4(&ip) {
                     ip_part = Some(format!("/ip4/{}", ip));
                 }
             }
             libp2p::multiaddr::Protocol::Ip6(ip) => {
-                if !ip.is_unspecified() {
+                if is_public_routable_ipv6(&ip) {
                     ip_part = Some(format!("/ip6/{}", ip));
                 }
             }
@@ -96,7 +173,9 @@ pub fn normalize_observed_address(
             | libp2p::multiaddr::Protocol::Dns4(dns)
             | libp2p::multiaddr::Protocol::Dns6(dns)
             | libp2p::multiaddr::Protocol::Dnsaddr(dns) => {
-                ip_part = Some(format!("/dns4/{}", dns));
+                if dns != "localhost" && dns.contains('.') {
+                    ip_part = Some(format!("/dns4/{}", dns));
+                }
             }
             libp2p::multiaddr::Protocol::QuicV1 => {
                 is_quic = true;
@@ -223,6 +302,61 @@ mod tests {
             normalized.to_string(),
             "/ip4/136.169.50.80/udp/4002/quic-v1"
         );
+    }
+
+    #[test]
+    fn test_is_public_routable_ipv4() {
+        use std::net::Ipv4Addr;
+
+        // Valid public IPs
+        assert!(is_public_routable_ipv4(&Ipv4Addr::new(136, 169, 50, 80)));
+        assert!(is_public_routable_ipv4(&Ipv4Addr::new(172, 238, 169, 224)));
+        assert!(is_public_routable_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_public_routable_ipv4(&Ipv4Addr::new(1, 1, 1, 1)));
+
+        // Private RFC 1918
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(10, 60, 7, 102)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(172, 31, 255, 255)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 168, 50, 156)));
+
+        // Loopback / Link-local / Unspecified / Broadcast
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(255, 255, 255, 255)));
+
+        // CGNAT (100.64.0.0/10)
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(100, 127, 255, 254)));
+        // 100.128.0.1 is outside CGNAT range
+        assert!(is_public_routable_ipv4(&Ipv4Addr::new(100, 128, 0, 1)));
+
+        // Documentation / Multicast
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(240, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_normalize_observed_address_rejects_private() {
+        // Private 10.x IP (like the observed 10.60.7.102)
+        let observed_10: libp2p::Multiaddr = "/ip4/10.60.7.102/tcp/54321".parse().unwrap();
+        assert!(normalize_observed_address(&observed_10, 4001, 4001).is_none());
+
+        // Private 192.168.x IP
+        let observed_192: libp2p::Multiaddr = "/ip4/192.168.50.156/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_192, 4001, 4001).is_none());
+
+        // Loopback
+        let observed_loopback: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_loopback, 4001, 4001).is_none());
+
+        // CGNAT
+        let observed_cgnat: libp2p::Multiaddr = "/ip4/100.64.1.2/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_cgnat, 4001, 4001).is_none());
     }
 
     #[test]

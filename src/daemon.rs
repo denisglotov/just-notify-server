@@ -160,6 +160,58 @@ pub async fn run_daemon(
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
+    // Clean up existing UDS socket file if present and ensure directory exists
+    if let Some(parent) = socket_path.parent() {
+        if !parent.exists() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    let ipc_listener = UnixListener::bind(&socket_path).with_context(|| {
+        format!(
+            "Failed to bind Unix Domain Socket at {}",
+            socket_path.display()
+        )
+    })?;
+
+    // RAII Guard to guarantee socket deletion on any exit or drop
+    let _socket_guard = SocketCleanupGuard {
+        path: socket_path.clone(),
+    };
+
+    info!(
+        "IPC Unix Domain Socket listening at {}",
+        socket_path.display()
+    );
+
+    // MPSC channel to receive IPC events from async socket tasks
+    let (ipc_tx, mut ipc_rx) = mpsc::channel::<DaemonEvent>(64);
+
+    // Spawn task to accept UDS IPC connections
+    let listener_tx = ipc_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match ipc_listener.accept().await {
+                Ok((stream, _)) => {
+                    let conn_tx = listener_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_ipc_connection(stream, conn_tx).await {
+                            debug!("IPC connection ended: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Non-fatal error accepting IPC connection: {:?}", e);
+                    // Add a tiny backoff on temporary OS errors (e.g. EMFILE, ECONNABORTED)
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    });
+
     // Listen on TCP multiaddress
     let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", tcp_port).parse()?;
     swarm.listen_on(tcp_addr.clone())?;
@@ -213,56 +265,10 @@ pub async fn run_daemon(
     let mut next_reannounce =
         tokio::time::Instant::now() + Duration::from_secs(progressive_delays[0]);
 
-    // Clean up existing UDS socket file if present
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    let ipc_listener = UnixListener::bind(&socket_path).with_context(|| {
-        format!(
-            "Failed to bind Unix Domain Socket at {}",
-            socket_path.display()
-        )
-    })?;
-
-    // RAII Guard to guarantee socket deletion on any exit or drop
-    let _socket_guard = SocketCleanupGuard {
-        path: socket_path.clone(),
-    };
-
-    info!(
-        "IPC Unix Domain Socket listening at {}",
-        socket_path.display()
-    );
-
-    // MPSC channel to receive IPC events from async socket tasks
-    let (ipc_tx, mut ipc_rx) = mpsc::channel::<DaemonEvent>(64);
-
-    // Spawn task to accept UDS IPC connections
-    let listener_tx = ipc_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match ipc_listener.accept().await {
-                Ok((stream, _)) => {
-                    let conn_tx = listener_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_ipc_connection(stream, conn_tx).await {
-                            debug!("IPC connection ended: {:?}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!("Non-fatal error accepting IPC connection: {:?}", e);
-                    // Add a tiny backoff on temporary OS errors (e.g. EMFILE, ECONNABORTED)
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-    });
-
     let mut pending_searches: HashMap<kad::QueryId, PendingSearch> = HashMap::new();
     let mut peer_lookups: HashMap<kad::QueryId, PeerId> = HashMap::new();
     let mut known_external_addrs: HashSet<Multiaddr> = HashSet::new();
+    let mut observed_candidates_quorum: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
     let mut bootstrapped = false;
 
     #[cfg(unix)]
@@ -336,6 +342,7 @@ pub async fn run_daemon(
                     &mut pending_searches,
                     &mut peer_lookups,
                     &mut known_external_addrs,
+                    &mut observed_candidates_quorum,
                     &mut bootstrapped,
                     &record_key,
                     &service_name,
@@ -566,6 +573,10 @@ fn handle_ipc_request(
     }
 }
 
+/// Minimum number of distinct peers that must observe the same public external address
+/// before the daemon accepts and advertises it.
+const OBSERVED_ADDR_QUORUM_THRESHOLD: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>,
@@ -573,6 +584,7 @@ fn handle_swarm_event(
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
     peer_lookups: &mut HashMap<kad::QueryId, PeerId>,
     known_external_addrs: &mut HashSet<Multiaddr>,
+    observed_candidates_quorum: &mut HashMap<Multiaddr, HashSet<PeerId>>,
     bootstrapped: &mut bool,
     record_key: &kad::RecordKey,
     service_name: &str,
@@ -584,13 +596,29 @@ fn handle_swarm_event(
             info!("Listening on multiaddress: {}", address);
         }
         libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-            info!("Confirmed external public address: {}", address);
-            if let Err(e) = swarm
-                .behaviour_mut()
-                .kademlia
-                .start_providing(record_key.clone())
+            if let Some(clean_addr) =
+                normalize_observed_address(&address, tcp_port, quic_port)
             {
-                debug!("Start providing on external address confirmation: {:?}", e);
+                if known_external_addrs.insert(clean_addr.clone()) {
+                    info!("Confirmed external public address: {}", clean_addr);
+                    swarm.add_external_address(clean_addr);
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .start_providing(record_key.clone())
+                    {
+                        debug!("Start providing on external address confirmation: {:?}", e);
+                    }
+                }
+            }
+        }
+        libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
+            if let Some(clean_addr) =
+                normalize_observed_address(&address, tcp_port, quic_port)
+            {
+                known_external_addrs.remove(&clean_addr);
+                swarm.remove_external_address(&clean_addr);
+                info!("External public address expired: {}", clean_addr);
             }
         }
         libp2p::swarm::SwarmEvent::NewExternalAddrCandidate { address } => {
@@ -629,16 +657,36 @@ fn handle_swarm_event(
                 peer_id, info.agent_version, info.protocols
             );
 
-            // Normalize observed external address to avoid accumulating ephemeral ports
+            // Normalize observed external address to verify public routability
             if let Some(clean_addr) =
                 normalize_observed_address(&info.observed_addr, tcp_port, quic_port)
             {
-                if known_external_addrs.insert(clean_addr.clone()) {
+                let voters = observed_candidates_quorum
+                    .entry(clean_addr.clone())
+                    .or_default();
+                voters.insert(peer_id);
+                let quorum_count = voters.len();
+
+                if quorum_count >= OBSERVED_ADDR_QUORUM_THRESHOLD
+                    && known_external_addrs.insert(clean_addr.clone())
+                {
                     info!(
-                        "Registered normalized external address candidate: {}",
-                        clean_addr
+                        "External public address confirmed by quorum ({} distinct peers): {}",
+                        quorum_count, clean_addr
                     );
                     swarm.add_external_address(clean_addr);
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .start_providing(record_key.clone())
+                    {
+                        debug!("Start providing on quorum external address confirmation: {:?}", e);
+                    }
+                } else if quorum_count < OBSERVED_ADDR_QUORUM_THRESHOLD {
+                    debug!(
+                        "Observed candidate address {} seen by {}/{} peers",
+                        clean_addr, quorum_count, OBSERVED_ADDR_QUORUM_THRESHOLD
+                    );
                 }
             }
 
@@ -678,6 +726,29 @@ fn handle_swarm_event(
             match autonat_event {
                 autonat::Event::StatusChanged { old, new } => {
                     info!("AutoNAT status changed from {:?} to {:?}", old, new);
+                    if let autonat::NatStatus::Public(ref public_addr) = new {
+                        if let Some(clean_addr) =
+                            normalize_observed_address(public_addr, tcp_port, quic_port)
+                        {
+                            if known_external_addrs.insert(clean_addr.clone()) {
+                                info!(
+                                    "AutoNAT confirmed public external address: {}",
+                                    clean_addr
+                                );
+                                swarm.add_external_address(clean_addr);
+                                if let Err(e) = swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .start_providing(record_key.clone())
+                                {
+                                    debug!(
+                                        "Start providing on AutoNAT confirmation: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {
                     debug!("AutoNAT event: {:?}", autonat_event);
