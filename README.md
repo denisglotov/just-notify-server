@@ -175,9 +175,6 @@ cargo run -- peers
   "peers": [
     {
       "peer_id": "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-      "ip_addresses": [
-        "ny5.bootstrap.libp2p.io"
-      ],
       "addresses": [
         "/dns4/ny5.bootstrap.libp2p.io/tcp/4001"
       ]
