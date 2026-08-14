@@ -8,6 +8,11 @@
 *.sock
 /tmp/
 
+# Identity key files
+*.key
+node.key
+
+
 # OS generated files
 .DS_Store
 .DS_Store?

@@ -1,5 +1,5 @@
 [package]
-name = "ipfs-server"
+name = "just-notify-server"
 version = "0.1.0"
 edition = "2021"
 description = "IPFS-compatible libp2p server daemon with UDS IPC and CLI control client"
@@ -17,8 +17,8 @@ libp2p = { version = "0.56", features = [
     "autonat",
     "tokio",
     "macros",
-    "rsa",
 ] }
+libp2p-connection-limits = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 clap = { version = "4", features = ["derive"] }
@@ -30,5 +30,4 @@ cid = "0.11"
 multihash = "0.19"
 sha2 = "0.11"
 anyhow = "1.0"
-thiserror = "2.0"
 futures = "0.3"

@@ -1,69 +1,108 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/just-notify-server.sock";
+pub const DEFAULT_SERVICE_NAME: &str = "org.dymka.just-notify-server";
+pub const DEFAULT_BOOTSTRAP_FILE: &str = "bootstrap_nodes.txt";
+pub const DEFAULT_KEY_FILE: &str = "node.key";
+pub const DEFAULT_TCP_PORT: u16 = 4001;
+pub const DEFAULT_QUIC_PORT: u16 = 4001;
+pub const DEFAULT_REANNOUNCE_INTERVAL_SECS: u64 = 1800;
+pub const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_ESTABLISHED_CONNS: u32 = 500;
+pub const DEFAULT_MAX_ESTABLISHED_PER_PEER: u32 = 3;
+pub const DEFAULT_MAX_PENDING_INCOMING_CONNS: u32 = 64;
+pub const DEFAULT_MAX_PENDING_OUTGOING_CONNS: u32 = 64;
+pub const DEFAULT_MAX_PROVIDED_KEYS: usize = 65_536;
+pub const DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Parser, Debug)]
-#[command(name = "ipfs-server")]
+#[command(name = "just-notify-server")]
 #[command(about = "IPFS-compatible libp2p server daemon and control CLI", long_about = None)]
 pub struct Cli {
+    /// Tracing log level filter (e.g. info, debug, warn, trace, error)
+    #[arg(long, global = true, default_value = "info")]
+    pub log_level: String,
+
+    /// Path to Unix Domain Socket for local IPC control
+    #[arg(long, global = true, default_value = DEFAULT_SOCKET_PATH)]
+    pub socket_path: PathBuf,
+
     #[command(subcommand)]
     pub command: Commands,
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     /// Start the libp2p IPFS server daemon
     Daemon {
         /// TCP listening port
-        #[arg(long, default_value_t = 4001)]
+        #[arg(long, default_value_t = DEFAULT_TCP_PORT)]
         tcp_port: u16,
 
         /// QUIC listening port (UDP)
-        #[arg(long, default_value_t = 4001)]
+        #[arg(long, default_value_t = DEFAULT_QUIC_PORT)]
         quic_port: u16,
 
-        /// Path to Unix Domain Socket for local IPC control
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
-        socket_path: PathBuf,
-
         /// Service name to automatically register on IPFS mainnet DHT
-        #[arg(long, default_value = "dymka-just-notify")]
+        #[arg(long, default_value = DEFAULT_SERVICE_NAME)]
         service_name: String,
 
         /// Interval in seconds to re-announce service provider record to DHT
-        #[arg(long, default_value_t = 1800)]
+        #[arg(long, default_value_t = DEFAULT_REANNOUNCE_INTERVAL_SECS)]
         reannounce_interval: u64,
 
         /// Path to text file containing bootstrap multiaddresses (one per line)
-        #[arg(long, default_value = "bootstrap_nodes.txt")]
+        #[arg(long, default_value = DEFAULT_BOOTSTRAP_FILE)]
         bootstrap_nodes_file: PathBuf,
 
-        /// Tracing log level filter (e.g. info, debug, warn, trace)
-        #[arg(long, default_value = "info")]
-        log_level: String,
+        /// Additional bootstrap multiaddress(es) or direct peer(s)
+        #[arg(long = "bootstrap-node", action = clap::ArgAction::Append)]
+        bootstrap_nodes: Vec<String>,
+
+        /// Path to ed25519 identity key file to persist node Peer ID across restarts
+        #[arg(long, default_value = DEFAULT_KEY_FILE)]
+        key_file: PathBuf,
+
+        /// Maximum total established peer connections
+        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_CONNS)]
+        max_connections: u32,
+
+        /// Maximum established connections per individual peer
+        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_PER_PEER)]
+        max_connections_per_peer: u32,
+
+        /// Maximum pending incoming connections
+        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_INCOMING_CONNS)]
+        max_pending_incoming_connections: u32,
+
+        /// Maximum pending outgoing connections
+        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_OUTGOING_CONNS)]
+        max_pending_outgoing_connections: u32,
+
+        /// Maximum number of provider keys stored in memory DHT store
+        #[arg(long, default_value_t = DEFAULT_MAX_PROVIDED_KEYS)]
+        max_provided_keys: usize,
+
+        /// Idle connection timeout in seconds before closing inactive connections
+        #[arg(long, default_value_t = DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS)]
+        idle_connection_timeout: u64,
     },
 
     /// Search IPFS mainnet DHT for providers of a service or CID
     Search {
-        /// Target service name or CID to search for (defaults to "dymka-just-notify")
-        #[arg(default_value = "dymka-just-notify")]
+        /// Target service name or CID to search for
+        #[arg(default_value = DEFAULT_SERVICE_NAME)]
         service_name: String,
 
-        /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
-        socket_path: PathBuf,
+        /// Search timeout in seconds
+        #[arg(long, default_value_t = DEFAULT_SEARCH_TIMEOUT_SECS)]
+        timeout: u64,
     },
 
     /// Query connected peers from the running daemon
-    Peers {
-        /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
-        socket_path: PathBuf,
-    },
+    Peers,
 
     /// Query node identity and routing table status from the daemon
-    Info {
-        /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
-        socket_path: PathBuf,
-    },
+    Info,
 }

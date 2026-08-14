@@ -148,12 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asn1_der"
-version = "0.7.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4858a9d740c5007a9069007c3b4e91152d0506f13c1b31dd49051fd537656156"
-
-[[package]]
 name = "async-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1384,26 +1378,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ipfs-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cid",
- "clap",
- "futures",
- "libp2p",
- "multihash",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1439,6 +1413,26 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "just-notify-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cid",
+ "clap",
+ "futures",
+ "libp2p",
+ "libp2p-connection-limits",
+ "multihash",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1608,14 +1602,12 @@ version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9525f3831544f7ae497bde79adf114ef127b0fbbb97edbbf692a80408636421c"
 dependencies = [
- "asn1_der",
  "bs58",
  "ed25519-dalek",
  "hkdf",
  "multihash",
  "prost",
  "rand 0.8.7",
- "ring",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tracing",

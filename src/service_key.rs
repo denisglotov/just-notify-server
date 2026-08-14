@@ -16,9 +16,7 @@ pub fn derive_service_multihash(input: &str) -> (Cid, Multihash<64>) {
     }
 
     // Otherwise compute SHA-256 digest of string
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
+    let digest = Sha256::digest(input.as_bytes());
 
     // Multihash code for SHA2-256 is 0x12
     let mhash =
@@ -32,12 +30,207 @@ pub fn derive_service_multihash(input: &str) -> (Cid, Multihash<64>) {
 
 /// Extracts a PeerId from a multiaddress if it contains a /p2p/<peer_id> component.
 pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
-    for protocol in addr.iter() {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = protocol {
-            return Some(peer_id);
+    addr.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
+}
+
+#[inline]
+fn is_valid_public_dns(dns: &str) -> bool {
+    dns != "localhost" && dns.contains('.')
+}
+
+/// Checks if an IPv4 address is globally routable on the public internet.
+/// Filters out private (RFC 1918), loopback (127.0.0.0/8), link-local (169.254.0.0/16),
+/// CGNAT / Shared address space (100.64.0.0/10), documentation, benchmarking, multicast, and broadcast/unspecified.
+pub fn is_public_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // Unspecified (0.0.0.0) or Broadcast (255.255.255.255)
+    if ip.is_unspecified() || ip.is_broadcast() {
+        return false;
+    }
+    // Loopback 127.0.0.0/8
+    if ip.is_loopback() {
+        return false;
+    }
+    // Private RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    if ip.is_private() {
+        return false;
+    }
+    // Link-local 169.254.0.0/16
+    if ip.is_link_local() {
+        return false;
+    }
+    // Shared / CGNAT (RFC 6598): 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    if octets[0] == 100 && (octets[1] & 0xc0) == 64 {
+        return false;
+    }
+    // IETF Protocol Assignments: 192.0.0.0/24
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return false;
+    }
+    // Documentation (RFC 5737): 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+    if ip.is_documentation() {
+        return false;
+    }
+    // Benchmarking (RFC 2544): 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+    if octets[0] == 198 && (octets[1] & 0xfe) == 18 {
+        return false;
+    }
+    // Direct Multicast 224.0.0.0/4 and Reserved (RFC 1112) 240.0.0.0/4
+    if ip.is_multicast() || octets[0] >= 240 {
+        return false;
+    }
+    true
+}
+
+/// Checks if an IPv6 address is globally routable on the public internet.
+/// Filters out unspecified (::), loopback (::1), unique local (fc00::/7),
+/// link-local (fe80::/10), documentation (2001:db8::/32), and multicast (ff00::/8).
+pub fn is_public_routable_ipv6(ip: &std::net::Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    // Unspecified (::)
+    if ip.is_unspecified() {
+        return false;
+    }
+    // Loopback (::1)
+    if ip.is_loopback() {
+        return false;
+    }
+    // Multicast ff00::/8
+    if ip.is_multicast() {
+        return false;
+    }
+    // Unique Local Address (ULA) fc00::/7
+    if (octets[0] & 0xfe) == 0xfc {
+        return false;
+    }
+    // Unicast Link-Local fe80::/10
+    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+        return false;
+    }
+    // Documentation 2001:db8::/32
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8 {
+        return false;
+    }
+    true
+}
+
+use anyhow::Context;
+
+/// Normalizes an observed multiaddress from an Identify protocol message.
+/// Ephemeral outgoing ports are replaced with the node's configured listening ports.
+/// Only globally routable public IP addresses are accepted.
+pub fn normalize_observed_address(
+    observed: &libp2p::Multiaddr,
+    tcp_port: u16,
+    quic_port: u16,
+) -> Option<libp2p::Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut host = None;
+    let mut is_quic = false;
+    let mut is_tcp = false;
+
+    for proto in observed {
+        match proto {
+            Protocol::Ip4(ip) if host.is_none() && is_public_routable_ipv4(ip) => {
+                host = Some(Protocol::Ip4(ip));
+            }
+            Protocol::Ip6(ip) if host.is_none() && is_public_routable_ipv6(&ip) => {
+                host = Some(Protocol::Ip6(ip));
+            }
+            Protocol::Dns(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns(dns));
+            }
+            Protocol::Dns4(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns4(dns));
+            }
+            Protocol::Dns6(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns6(dns));
+            }
+            Protocol::Dnsaddr(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dnsaddr(dns));
+            }
+            Protocol::QuicV1 => {
+                is_quic = true;
+            }
+            Protocol::Tcp(_) => {
+                is_tcp = true;
+            }
+            _ => {}
         }
     }
-    None
+
+    let host = host?;
+    let mut normalized = libp2p::Multiaddr::empty();
+    normalized.push(host);
+
+    if is_quic {
+        normalized.push(Protocol::Udp(quic_port));
+        normalized.push(Protocol::QuicV1);
+        Some(normalized)
+    } else if is_tcp {
+        normalized.push(Protocol::Tcp(tcp_port));
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+/// Loads a keypair from a file if it exists, or generates a new ed25519 keypair and saves it.
+/// If no path is provided, a new in-memory ed25519 keypair is generated.
+pub fn load_or_generate_keypair(
+    key_path: Option<&std::path::Path>,
+) -> anyhow::Result<libp2p::identity::Keypair> {
+    if let Some(path) = key_path {
+        if path.exists() {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read keypair file at '{}'", path.display()))?;
+            let keypair =
+                libp2p::identity::Keypair::from_protobuf_encoding(&bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode keypair from '{}': {:?}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            return Ok(keypair);
+        }
+
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let bytes = keypair
+            .to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("Failed to encode generated keypair: {:?}", e))?;
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true).mode(0o600);
+            let mut file = options.open(path).with_context(|| {
+                format!("Failed to create keypair file at '{}'", path.display())
+            })?;
+            file.write_all(&bytes)
+                .with_context(|| format!("Failed to write keypair file at '{}'", path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &bytes)
+                .with_context(|| format!("Failed to save keypair file to '{}'", path.display()))?;
+        }
+
+        Ok(keypair)
+    } else {
+        Ok(libp2p::identity::Keypair::generate_ed25519())
+    }
 }
 
 #[cfg(test)]
@@ -45,16 +238,28 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    /// Validates deterministic SHA2-256 multihash and CIDv1 derivation from arbitrary service name strings.
+    ///
+    /// - Guarantees consistent IPFS content addressing across different daemon instances and CLI calls.
+    /// - Ensures provider advertisements and query searches map to the exact same DHT record key (code 0x12, raw multihash).
     #[test]
     fn test_derive_service_multihash() {
-        let (cid1, mh1) = derive_service_multihash("dymka-just-notify");
-        let (cid2, mh2) = derive_service_multihash("dymka-just-notify");
+        let (cid1, mh1) = derive_service_multihash("org.dymka.just-notify-server");
+        let (cid2, mh2) = derive_service_multihash("org.dymka.just-notify-server");
 
         assert_eq!(cid1, cid2);
+        assert_eq!(
+            cid1.to_string(),
+            "bafkreic62cvyvkn5knp2gujymlpzd3y4brmdqlw42n52lt522an2xapsne"
+        );
         assert_eq!(mh1, mh2);
         assert_eq!(mh1.code(), 0x12);
     }
 
+    /// Verifies that valid existing CID strings are passed through without re-hashing.
+    ///
+    /// - Allows users to query or advertise directly by raw IPFS CID string in addition to service names.
+    /// - Prevents accidental double-hashing of valid IPFS CIDs.
     #[test]
     fn test_valid_cid_passthrough() {
         let cid_str = "bafybeicg253nyacwgahb3h4q6tx5v23e6qyr2m4eecw6srm6f3r7w3m2py";
@@ -62,6 +267,10 @@ mod tests {
         assert_eq!(cid.to_string(), cid_str);
     }
 
+    /// Validates extracting PeerId from libp2p multiaddresses containing `/p2p/<PeerId>`.
+    ///
+    /// - Essential for parsing bootstrap node lists and peer addresses with embedded peer identities.
+    /// - Ensures correct extraction for establishing direct Kademlia dials.
     #[test]
     fn test_extract_peer_id() {
         let addr_str =
@@ -72,5 +281,158 @@ mod tests {
             peer_id.to_string(),
             "QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
         );
+    }
+
+    /// Verifies that observed TCP multiaddresses with ephemeral NAT ports are normalized to the daemon's listening TCP port.
+    ///
+    /// - In NAT environments, remote peers observe outgoing ephemeral source ports rather than listening ports.
+    /// - Normalization ensures remote peers can dial back to our actual listening port.
+    #[test]
+    fn test_normalize_observed_address_tcp() {
+        let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/tcp/54358".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4001).unwrap();
+        assert_eq!(normalized.to_string(), "/ip4/136.169.50.80/tcp/4001");
+    }
+
+    /// Verifies that observed QUIC multiaddresses (`/udp/<port>/quic-v1`) are normalized to the daemon's listening QUIC port.
+    ///
+    /// - Ensures QUIC transport addresses retain the correct UDP port and QUIC-v1 protocol identifier when discovered via AutoNAT/Identify.
+    #[test]
+    fn test_normalize_observed_address_quic() {
+        let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/udp/1027/quic-v1".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4002).unwrap();
+        assert_eq!(
+            normalized.to_string(),
+            "/ip4/136.169.50.80/udp/4002/quic-v1"
+        );
+    }
+
+    /// Verifies IPv6 address handling and port normalization.
+    ///
+    /// - Ensures dual-stack / IPv6 public addresses are properly identified and formatted with the correct port.
+    #[test]
+    fn test_normalize_observed_address_ipv6() {
+        let observed: libp2p::Multiaddr = "/ip6/2600:1900::1/tcp/54358".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4001).unwrap();
+        assert_eq!(normalized.to_string(), "/ip6/2600:1900::1/tcp/4001");
+    }
+
+    /// Verifies normalization across domain-based protocols (`/dns4/`, `/dns6/`, `/dnsaddr/`).
+    ///
+    /// - Ensures bootstrap nodes and domain-based addresses are properly normalized and validated against public DNS rules.
+    #[test]
+    fn test_normalize_observed_address_dns_protocols() {
+        let obs_dns4: libp2p::Multiaddr = "/dns4/bootstrap.libp2p.io/tcp/54358".parse().unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dns4, 4001, 4001)
+                .unwrap()
+                .to_string(),
+            "/dns4/bootstrap.libp2p.io/tcp/4001"
+        );
+
+        let obs_dns6: libp2p::Multiaddr = "/dns6/bootstrap.libp2p.io/udp/1234/quic-v1"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dns6, 4001, 4002)
+                .unwrap()
+                .to_string(),
+            "/dns6/bootstrap.libp2p.io/udp/4002/quic-v1"
+        );
+
+        let obs_dnsaddr: libp2p::Multiaddr =
+            "/dnsaddr/bootstrap.libp2p.io/tcp/9999".parse().unwrap();
+        assert_eq!(
+            normalize_observed_address(&obs_dnsaddr, 4001, 4001)
+                .unwrap()
+                .to_string(),
+            "/dnsaddr/bootstrap.libp2p.io/tcp/4001"
+        );
+    }
+
+    /// Comprehensive verification of public routable IPv4 address classification.
+    ///
+    /// - Guards against advertising invalid or non-routable addresses to the public DHT.
+    /// - Verifies filtering for RFC 1918 (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10),
+    ///   loopback (127/8), link-local (169.254/16), documentation, multicast, and broadcast ranges.
+    #[test]
+    fn test_is_public_routable_ipv4() {
+        use std::net::Ipv4Addr;
+
+        // Valid public IPs
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(136, 169, 50, 80)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(172, 238, 169, 224)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
+
+        // Private RFC 1918
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(10, 60, 7, 102)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(172, 31, 255, 255)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 168, 50, 156)));
+
+        // Loopback / Link-local / Unspecified / Broadcast
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(255, 255, 255, 255)));
+
+        // CGNAT (100.64.0.0/10)
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(100, 127, 255, 254)));
+        // 100.128.0.1 is outside CGNAT range
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(100, 128, 0, 1)));
+
+        // Documentation / Multicast
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(240, 0, 0, 1)));
+    }
+
+    /// Verifies that private and loopback multiaddresses are rejected during address normalization.
+    ///
+    /// - Prevents local network addresses from being registered as candidate external addresses.
+    #[test]
+    fn test_normalize_observed_address_rejects_private() {
+        // Private 10.x IP (like the observed 10.60.7.102)
+        let observed_10: libp2p::Multiaddr = "/ip4/10.60.7.102/tcp/54321".parse().unwrap();
+        assert!(normalize_observed_address(&observed_10, 4001, 4001).is_none());
+
+        // Private 192.168.x IP
+        let observed_192: libp2p::Multiaddr = "/ip4/192.168.50.156/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_192, 4001, 4001).is_none());
+
+        // Loopback
+        let observed_loopback: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_loopback, 4001, 4001).is_none());
+
+        // CGNAT
+        let observed_cgnat: libp2p::Multiaddr = "/ip4/100.64.1.2/tcp/4001".parse().unwrap();
+        assert!(normalize_observed_address(&observed_cgnat, 4001, 4001).is_none());
+    }
+
+    /// Verifies persisting and reloading an Ed25519 keypair from disk.
+    ///
+    /// - Ensures node identity (PeerId) remains stable and deterministic across server restarts.
+    /// - Verifies key serialization and file loading roundtrips properly.
+    #[test]
+    fn test_keypair_persistence() {
+        let temp_dir = std::env::temp_dir();
+        let key_file = temp_dir.join(format!(
+            "test_key_{}.key",
+            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
+        ));
+
+        let kp1 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let peer_id1 = libp2p::PeerId::from(kp1.public());
+
+        let kp2 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let peer_id2 = libp2p::PeerId::from(kp2.public());
+
+        assert_eq!(peer_id1, peer_id2);
+
+        let _ = std::fs::remove_file(&key_file);
     }
 }
