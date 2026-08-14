@@ -68,6 +68,7 @@ pub struct DaemonConfig {
     pub max_pending_incoming_connections: u32,
     pub max_pending_outgoing_connections: u32,
     pub max_provided_keys: usize,
+    pub idle_connection_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -238,7 +239,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                 autonat,
             })
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(config.idle_connection_timeout))
         .build();
 
     // Clean up existing UDS socket file if present and ensure directory exists
@@ -1151,6 +1152,7 @@ mod tests {
                 max_pending_incoming_connections: 64,
                 max_pending_outgoing_connections: 64,
                 max_provided_keys: 65_536,
+                idle_connection_timeout: Duration::from_secs(300),
             };
             let res = run_daemon(config).await;
             if let Err(e) = res {
@@ -1566,6 +1568,7 @@ mod tests {
             max_pending_incoming_connections: 64,
             max_pending_outgoing_connections: 64,
             max_provided_keys: 65_536,
+            idle_connection_timeout: Duration::from_secs(300),
         };
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)

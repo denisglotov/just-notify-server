@@ -14,6 +14,7 @@ pub const DEFAULT_MAX_ESTABLISHED_PER_PEER: u32 = 3;
 pub const DEFAULT_MAX_PENDING_INCOMING_CONNS: u32 = 64;
 pub const DEFAULT_MAX_PENDING_OUTGOING_CONNS: u32 = 64;
 pub const DEFAULT_MAX_PROVIDED_KEYS: usize = 65_536;
+pub const DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Parser, Debug)]
 #[command(name = "just-notify-server")]
@@ -82,6 +83,10 @@ pub enum Commands {
         /// Maximum number of provider keys stored in memory DHT store
         #[arg(long, default_value_t = DEFAULT_MAX_PROVIDED_KEYS)]
         max_provided_keys: usize,
+
+        /// Idle connection timeout in seconds before closing inactive connections
+        #[arg(long, default_value_t = DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS)]
+        idle_connection_timeout: u64,
     },
 
     /// Search IPFS mainnet DHT for providers of a service or CID

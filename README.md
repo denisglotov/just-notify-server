@@ -130,6 +130,7 @@ cargo run -- daemon
   --bootstrap-node /ip4/192.168.1.50/tcp/4001/p2p/12D3KooW... \
   --service-name org.dymka.just-notify-server \
   --reannounce-interval 1800 \
+  --idle-connection-timeout 300 \
   --log-level info
 ```
 

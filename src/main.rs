@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
             max_pending_incoming_connections,
             max_pending_outgoing_connections,
             max_provided_keys,
+            idle_connection_timeout,
         } => {
             let config = daemon::DaemonConfig {
                 tcp_port,
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 max_pending_incoming_connections,
                 max_pending_outgoing_connections,
                 max_provided_keys,
+                idle_connection_timeout: std::time::Duration::from_secs(idle_connection_timeout),
             };
             daemon::run_daemon(config).await?;
         }
