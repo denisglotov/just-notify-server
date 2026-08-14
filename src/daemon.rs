@@ -59,6 +59,7 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub service_name: String,
     pub reannounce_interval: Duration,
+    pub pinning_maintenance_interval: Duration,
     pub bootstrap_nodes_file: PathBuf,
     pub cli_bootstrap_nodes: Vec<String>,
     pub key_file: PathBuf,
@@ -77,6 +78,7 @@ struct DaemonState {
     known_external_addrs: HashSet<Multiaddr>,
     observed_candidates_quorum: HashMap<Multiaddr, HashSet<PeerId>>,
     bootstrapped: bool,
+    pinned_peers: HashSet<PeerId>,
 }
 
 struct PendingSearch {
@@ -357,6 +359,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let max_reannounce_interval = config.reannounce_interval;
     let mut reannounce_timer = Box::pin(tokio::time::sleep(current_reannounce_interval));
 
+    let mut pinned_peers_timer = tokio::time::interval(config.pinning_maintenance_interval);
+    pinned_peers_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     info!("Daemon running. Awaiting network events and IPC client commands...");
 
     loop {
@@ -371,6 +376,35 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down daemon...");
                 break;
+            }
+
+            // Periodic pinned peers maintenance
+            _ = pinned_peers_timer.tick() => {
+                // Discover from local store
+                let local_peer = *swarm.local_peer_id();
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .providers(&record_key)
+                    .into_iter()
+                    .map(|rec| rec.provider)
+                    .filter(|p| *p != local_peer && state.pinned_peers.insert(*p))
+                    .for_each(|p| {
+                        info!("Pinning newly discovered provider peer from local store: {}", p);
+                        let _ = swarm.dial(p);
+                    });
+
+                // Redial disconnected
+                let connected_peers: HashSet<_> = swarm.connected_peers().copied().collect();
+                state
+                    .pinned_peers
+                    .iter()
+                    .filter(|p| !connected_peers.contains(p))
+                    .for_each(|p| {
+                        debug!("Re-dialing disconnected pinned peer {}", p);
+                        let _ = swarm.dial(*p);
+                    });
             }
 
             // IPC commands from client
@@ -769,6 +803,7 @@ fn handle_swarm_event(
                 swarm,
                 &mut state.pending_searches,
                 &mut state.peer_lookups,
+                &mut state.pinned_peers,
                 record_key,
                 &config.service_name,
             );
@@ -879,6 +914,7 @@ fn handle_kademlia_event(
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
     peer_lookups: &mut HashMap<kad::QueryId, PeerId>,
+    pinned_peers: &mut HashSet<PeerId>,
     record_key: &kad::RecordKey,
     service_name: &str,
 ) {
@@ -888,10 +924,22 @@ fn handle_kademlia_event(
         } => {
             match result {
                 kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                    key,
                     providers,
                     ..
                 })) => {
                     debug!("Found {} provider(s) for query {:?}", providers.len(), id);
+                    if key == *record_key {
+                        let local_peer = *swarm.local_peer_id();
+                        providers
+                            .iter()
+                            .filter(|&&p| p != local_peer && pinned_peers.insert(p))
+                            .for_each(|&p| {
+                                info!("Pinning newly discovered provider peer for our CID: {}", p);
+                                let _ = swarm.dial(p);
+                            });
+                    }
+
                     if let Some(pending) = pending_searches.get_mut(&id) {
                         for p in providers {
                             let mut addrs: HashSet<Multiaddr> = get_kademlia_peer_addresses(
@@ -1119,6 +1167,7 @@ mod tests {
                 socket_path: sock_clone,
                 service_name: "test-service".to_string(),
                 reannounce_interval: Duration::from_secs(3600),
+                pinning_maintenance_interval: Duration::from_secs(60),
                 bootstrap_nodes_file: PathBuf::from("non_existent_bootstrap.txt"),
                 cli_bootstrap_nodes: vec![
                     "/ip4/127.0.0.1/tcp/49999/p2p/QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
@@ -1551,6 +1600,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/test.sock"),
             service_name: "test-service".to_string(),
             reannounce_interval: Duration::from_secs(3600),
+            pinning_maintenance_interval: Duration::from_secs(60),
             bootstrap_nodes_file: PathBuf::from("non_existent.txt"),
             cli_bootstrap_nodes: vec![],
             key_file: PathBuf::from("/tmp/test.key"),
