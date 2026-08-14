@@ -1020,8 +1020,8 @@ fn get_kademlia_peer_addresses(
     peer: &PeerId,
 ) -> Vec<Multiaddr> {
     kademlia
-        .kbuckets()
-        .find_map(|bucket| {
+        .kbucket(*peer)
+        .and_then(|bucket| {
             bucket
                 .iter()
                 .find(|entry| entry.node.key.preimage() == peer)
@@ -1319,5 +1319,34 @@ mod tests {
         assert!(quorum_map.contains_key(&new_addr));
         // Favored address with 2 votes should not have been evicted
         assert!(quorum_map.contains_key(&favored_addr));
+    }
+
+    #[test]
+    fn test_get_kademlia_peer_addresses() {
+        let local_peer = PeerId::random();
+        let store = kad::store::MemoryStore::new(local_peer);
+        let mut kademlia = kad::Behaviour::new(local_peer, store);
+
+        let target_peer = PeerId::random();
+        let addr1: Multiaddr = "/ip4/198.51.100.1/tcp/4001".parse().unwrap();
+        let addr2: Multiaddr = "/ip4/198.51.100.1/udp/4001/quic-v1".parse().unwrap();
+
+        // Non-existent peer returns empty list
+        let empty = get_kademlia_peer_addresses(&mut kademlia, &target_peer);
+        assert!(empty.is_empty());
+
+        // Add addresses to routing table
+        kademlia.add_address(&target_peer, addr1.clone());
+        kademlia.add_address(&target_peer, addr2.clone());
+
+        // Lookup retrieves both addresses efficiently via kbucket index
+        let resolved = get_kademlia_peer_addresses(&mut kademlia, &target_peer);
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved
+            .iter()
+            .any(|a| a.to_string().contains("198.51.100.1") && a.to_string().contains("tcp")));
+        assert!(resolved
+            .iter()
+            .any(|a| a.to_string().contains("198.51.100.1") && a.to_string().contains("quic-v1")));
     }
 }
