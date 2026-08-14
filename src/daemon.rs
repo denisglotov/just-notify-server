@@ -1,11 +1,11 @@
 use crate::behaviour::{AppBehaviour, AppBehaviourEvent};
 use crate::ipc::{IpcRequest, IpcResponse};
-use crate::service_key::{self, extract_ip_addresses, extract_peer_id};
+use crate::service_key::{self, extract_ip_addresses, extract_peer_id, normalize_observed_address};
 
 use anyhow::Context;
 use futures::{SinkExt, StreamExt};
 use libp2p::kad::store::RecordStore;
-use libp2p::{autonat, identify, identity, kad, ping, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::{autonat, identify, kad, ping, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,12 +14,11 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LinesCodec};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProvider {
     pub peer_id: String,
-    pub ip_addresses: Vec<String>,
     pub addresses: Vec<String>,
 }
 
@@ -51,43 +50,50 @@ impl Drop for SocketCleanupGuard {
     }
 }
 
-fn load_bootstrap_nodes(file_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
-    if !file_path.exists() {
+fn load_bootstrap_nodes(
+    file_path: &std::path::Path,
+    cli_nodes: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut all_nodes = Vec::new();
+
+    if file_path.exists() {
+        let content = std::fs::read_to_string(file_path).with_context(|| {
+            format!(
+                "Failed to read bootstrap nodes file at '{}'",
+                file_path.display()
+            )
+        })?;
+
+        let nodes: Vec<String> = content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.to_string())
+            .collect();
+
+        info!(
+            "Loaded {} bootstrap node(s) from {}",
+            nodes.len(),
+            file_path.display()
+        );
+        all_nodes.extend(nodes);
+    } else if cli_nodes.is_empty() {
         anyhow::bail!(
-            "Bootstrap nodes file does not exist at '{}'. Please create the file or specify a valid path using --bootstrap-nodes-file <PATH>",
+            "Bootstrap nodes file does not exist at '{}' and no --bootstrap-node CLI options provided.",
             file_path.display()
         );
     }
 
-    let content = std::fs::read_to_string(file_path).with_context(|| {
-        format!(
-            "Failed to read bootstrap nodes file at '{}'",
-            file_path.display()
-        )
-    })?;
+    all_nodes.extend(cli_nodes.iter().cloned());
 
-    let nodes: Vec<String> = content
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.to_string())
-        .collect();
-
-    if nodes.is_empty() {
-        anyhow::bail!(
-            "Bootstrap nodes file at '{}' contains no valid multiaddresses",
-            file_path.display()
-        );
+    if all_nodes.is_empty() {
+        anyhow::bail!("No valid bootstrap nodes provided");
     }
 
-    info!(
-        "Loaded {} bootstrap node(s) from {}",
-        nodes.len(),
-        file_path.display()
-    );
-    Ok(nodes)
+    Ok(all_nodes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_daemon(
     tcp_port: u16,
     quic_port: u16,
@@ -95,13 +101,16 @@ pub async fn run_daemon(
     service_name: String,
     reannounce_interval_secs: u64,
     bootstrap_nodes_file: PathBuf,
+    cli_bootstrap_nodes: Vec<String>,
+    key_file: PathBuf,
 ) -> anyhow::Result<()> {
     info!("Starting IPFS libp2p server daemon...");
 
-    // Generate identity keypair
-    let local_key = identity::Keypair::generate_ed25519();
+    // Load or generate identity keypair
+    let local_key = service_key::load_or_generate_keypair(Some(&key_file))?;
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local Peer ID: {}", local_peer_id);
+    info!("Node identity persisted at: {}", key_file.display());
 
     // Build swarm with TCP + DNS + QUIC transports
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -119,11 +128,13 @@ pub async fn run_daemon(
             // Kademlia store & config
             let store = kad::store::MemoryStore::new(peer_id);
             let mut kad_config = kad::Config::default();
-            kad_config.set_query_timeout(Duration::from_secs(60));
+            kad_config.set_query_timeout(Duration::from_secs(30));
             if let Some(replication) = std::num::NonZeroUsize::new(20) {
                 kad_config.set_replication_factor(replication);
             }
-            kad_config.set_provider_publication_interval(Some(Duration::from_secs(1800)));
+            kad_config.set_provider_publication_interval(Some(Duration::from_secs(
+                reannounce_interval_secs,
+            )));
             let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
 
@@ -159,8 +170,8 @@ pub async fn run_daemon(
     swarm.listen_on(quic_addr.clone())?;
     info!("Listening for P2P QUIC connections on {}", quic_addr);
 
-    let bootstrap_addrs = load_bootstrap_nodes(&bootstrap_nodes_file)?;
-    info!("Bootstrapping into public IPFS network...");
+    let bootstrap_addrs = load_bootstrap_nodes(&bootstrap_nodes_file, &cli_bootstrap_nodes)?;
+    info!("Bootstrapping into IPFS / libp2p network...");
     for addr_str in &bootstrap_addrs {
         match addr_str.parse::<Multiaddr>() {
             Ok(addr) => {
@@ -173,7 +184,7 @@ pub async fn run_daemon(
                 if let Err(e) = swarm.dial(addr.clone()) {
                     debug!("Failed to dial bootstrap node {}: {:?}", addr, e);
                 } else {
-                    info!("Dialing IPFS bootstrap node: {}", addr);
+                    info!("Dialing bootstrap node: {}", addr);
                 }
             }
             Err(err) => {
@@ -188,29 +199,19 @@ pub async fn run_daemon(
         warn!("Kademlia initial bootstrap trigger warning: {:?}", e);
     }
 
-    // Register service provider record ("dymka-just-notify")
+    // Register service provider record ("org.dymka.just-notify-server")
     let (service_cid, service_mhash) = service_key::derive_service_multihash(&service_name);
     let record_key = kad::RecordKey::new(&service_mhash.to_bytes());
     info!(
-        "Registering provider record for service '{}' (CID: {}) on IPFS DHT",
+        "Configured provider record for service '{}' (CID: {}) on IPFS DHT",
         service_name, service_cid
     );
 
-    match swarm
-        .behaviour_mut()
-        .kademlia
-        .start_providing(record_key.clone())
-    {
-        Ok(query_id) => info!(
-            "Started providing service '{}' (Query ID: {:?})",
-            service_name, query_id
-        ),
-        Err(e) => error!("Failed to start providing service: {:?}", e),
-    }
-
-    // Setup periodic re-announcement timer
-    let mut reannounce_timer = tokio::time::interval(Duration::from_secs(reannounce_interval_secs));
-    reannounce_timer.reset();
+    // Progressive re-announcement delays for initial warmup: 3s, 10s, 30s, 60s, 120s
+    let progressive_delays = [3, 10, 30, 60, 120];
+    let mut progressive_idx = 0;
+    let mut next_reannounce =
+        tokio::time::Instant::now() + Duration::from_secs(progressive_delays[0]);
 
     // Clean up existing UDS socket file if present
     if socket_path.exists() {
@@ -235,29 +236,33 @@ pub async fn run_daemon(
     );
 
     // MPSC channel to receive IPC events from async socket tasks
-    let (ipc_tx, mut ipc_rx) = mpsc::channel::<DaemonEvent>(32);
+    let (ipc_tx, mut ipc_rx) = mpsc::channel::<DaemonEvent>(64);
 
     // Spawn task to accept UDS IPC connections
+    let listener_tx = ipc_tx.clone();
     tokio::spawn(async move {
         loop {
             match ipc_listener.accept().await {
                 Ok((stream, _)) => {
-                    let ipc_tx = ipc_tx.clone();
+                    let conn_tx = listener_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_ipc_connection(stream, ipc_tx).await {
+                        if let Err(e) = handle_ipc_connection(stream, conn_tx).await {
                             debug!("IPC connection ended: {:?}", e);
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Error accepting IPC connection: {:?}", e);
-                    break;
+                    warn!("Non-fatal error accepting IPC connection: {:?}", e);
+                    // Add a tiny backoff on temporary OS errors (e.g. EMFILE, ECONNABORTED)
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
     });
 
     let mut pending_searches: HashMap<kad::QueryId, PendingSearch> = HashMap::new();
+    let mut peer_lookups: HashMap<kad::QueryId, PeerId> = HashMap::new();
+    let mut known_external_addrs: HashSet<Multiaddr> = HashSet::new();
     let mut bootstrapped = false;
 
     #[cfg(unix)]
@@ -288,18 +293,26 @@ pub async fn run_daemon(
                 break;
             }
 
-            // Periodic service re-announcement
-            _ = reannounce_timer.tick() => {
-                info!("Re-announcing service '{}' provider record to IPFS DHT", service_name);
+            // Progressive and periodic service re-announcements
+            _ = tokio::time::sleep_until(next_reannounce) => {
+                info!("Announcing service '{}' provider record to IPFS DHT", service_name);
                 if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(record_key.clone()) {
-                    error!("Re-announcement failed: {:?}", e);
+                    debug!("Provider announcement query error: {:?}", e);
+                }
+
+                // Calculate next reannounce time
+                if progressive_idx + 1 < progressive_delays.len() {
+                    progressive_idx += 1;
+                    next_reannounce = tokio::time::Instant::now() + Duration::from_secs(progressive_delays[progressive_idx]);
+                } else {
+                    next_reannounce = tokio::time::Instant::now() + Duration::from_secs(reannounce_interval_secs);
                 }
             }
 
             // IPC commands from client
-            Some(event) = ipc_rx.recv() => {
-                match event {
-                    DaemonEvent::Ipc { request, responder } => {
+            maybe_event = ipc_rx.recv() => {
+                match maybe_event {
+                    Some(DaemonEvent::Ipc { request, responder }) => {
                         handle_ipc_request(
                             request,
                             responder,
@@ -308,6 +321,9 @@ pub async fn run_daemon(
                             &service_name,
                             &mut pending_searches,
                         );
+                    }
+                    None => {
+                        warn!("IPC receiver stream closed");
                     }
                 }
             }
@@ -318,9 +334,13 @@ pub async fn run_daemon(
                     event,
                     &mut swarm,
                     &mut pending_searches,
+                    &mut peer_lookups,
+                    &mut known_external_addrs,
                     &mut bootstrapped,
                     &record_key,
                     &service_name,
+                    tcp_port,
+                    quic_port,
                 );
             }
         }
@@ -334,23 +354,58 @@ async fn handle_ipc_connection(
     stream: UnixStream,
     ipc_tx: mpsc::Sender<DaemonEvent>,
 ) -> anyhow::Result<()> {
-    let mut framed = Framed::new(stream, LinesCodec::new());
+    let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(1024 * 1024));
 
     while let Some(line_res) = framed.next().await {
-        let line = line_res?;
-        let request: IpcRequest = serde_json::from_str(&line)?;
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                debug!("Error reading line from IPC client: {:?}", e);
+                break;
+            }
+        };
+
+        let request: IpcRequest = match serde_json::from_str(&line) {
+            Ok(req) => req,
+            Err(e) => {
+                let resp = IpcResponse::Error {
+                    message: format!("Invalid JSON request: {}", e),
+                };
+                let _ = framed.send(serde_json::to_string(&resp)?).await;
+                continue;
+            }
+        };
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        ipc_tx
+        if let Err(e) = ipc_tx
             .send(DaemonEvent::Ipc {
                 request,
                 responder: resp_tx,
             })
-            .await?;
+            .await
+        {
+            let resp = IpcResponse::Error {
+                message: format!("Daemon internal channel error: {}", e),
+            };
+            let _ = framed.send(serde_json::to_string(&resp)?).await;
+            break;
+        }
 
-        if let Ok(response) = resp_rx.await {
-            let json_resp = serde_json::to_string(&response)?;
-            framed.send(json_resp).await?;
+        match resp_rx.await {
+            Ok(response) => {
+                let json_resp = serde_json::to_string(&response)?;
+                if let Err(e) = framed.send(json_resp).await {
+                    debug!("Failed to send response to IPC client: {:?}", e);
+                    break;
+                }
+            }
+            Err(_) => {
+                let resp = IpcResponse::Error {
+                    message: "Daemon dropped response channel".to_string(),
+                };
+                let _ = framed.send(serde_json::to_string(&resp)?).await;
+                break;
+            }
         }
     }
     Ok(())
@@ -430,6 +485,7 @@ fn handle_ipc_request(
                 ));
                 initial_providers.insert(provider, addrs);
             }
+
             if service_name == daemon_service_name {
                 let mut local_addrs: HashSet<Multiaddr> = swarm.listeners().cloned().collect();
                 local_addrs.extend(swarm.external_addresses().cloned());
@@ -510,13 +566,18 @@ fn handle_ipc_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>,
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
+    peer_lookups: &mut HashMap<kad::QueryId, PeerId>,
+    known_external_addrs: &mut HashSet<Multiaddr>,
     bootstrapped: &mut bool,
     record_key: &kad::RecordKey,
     service_name: &str,
+    tcp_port: u16,
+    quic_port: u16,
 ) {
     match event {
         libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
@@ -538,20 +599,27 @@ fn handle_swarm_event(
         libp2p::swarm::SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
-            info!(
+            debug!(
                 "Connection established with peer {} via {:?}",
                 peer_id,
                 endpoint.get_remote_address()
             );
         }
         libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            info!("Outgoing connection error to {:?}: {:?}", peer_id, error);
+            debug!("Outgoing connection error to {:?}: {:?}", peer_id, error);
         }
         libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             debug!("Connection closed with peer {}: {:?}", peer_id, cause);
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Kademlia(kad_event)) => {
-            handle_kademlia_event(kad_event, swarm, pending_searches, record_key, service_name);
+            handle_kademlia_event(
+                kad_event,
+                swarm,
+                pending_searches,
+                peer_lookups,
+                record_key,
+                service_name,
+            );
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
             identify::Event::Received { peer_id, info, .. },
@@ -560,14 +628,32 @@ fn handle_swarm_event(
                 "Identify received from {}: agent='{}', protocols={:?}",
                 peer_id, info.agent_version, info.protocols
             );
-            // Register observed address as external address on the swarm
-            info!(
-                "Observed external address candidate from {}: {}",
-                peer_id, info.observed_addr
-            );
-            swarm.add_external_address(info.observed_addr.clone());
 
-            // Kademlia requires manual insertion of discovered peers into its routing table
+            // Normalize observed external address to avoid accumulating ephemeral ports
+            if let Some(clean_addr) =
+                normalize_observed_address(&info.observed_addr, tcp_port, quic_port)
+            {
+                if known_external_addrs.insert(clean_addr.clone()) {
+                    info!(
+                        "Registered normalized external address candidate: {}",
+                        clean_addr
+                    );
+                    swarm.add_external_address(clean_addr);
+                }
+            }
+
+            // Update any active search that is waiting for this peer's addresses
+            for search in pending_searches.values() {
+                let mut lock = match search.providers.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if let Some(addrs) = lock.get_mut(&peer_id) {
+                    addrs.extend(info.listen_addrs.clone());
+                }
+            }
+
+            // Kademlia requires insertion of discovered peers into its routing table
             for addr in info.listen_addrs {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             }
@@ -609,6 +695,7 @@ fn handle_kademlia_event(
     event: kad::Event,
     swarm: &mut Swarm<AppBehaviour>,
     pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
+    peer_lookups: &mut HashMap<kad::QueryId, PeerId>,
     record_key: &kad::RecordKey,
     service_name: &str,
 ) {
@@ -621,16 +708,44 @@ fn handle_kademlia_event(
                     providers,
                     ..
                 })) => {
-                    info!("Found {} provider(s) for query {:?}", providers.len(), id);
+                    debug!("Found {} provider(s) for query {:?}", providers.len(), id);
                     if let Some(pending) = pending_searches.get(&id) {
-                        let mut lock = pending.providers.lock().unwrap();
+                        let mut lock = match pending.providers.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         for p in providers {
-                            let addrs: HashSet<Multiaddr> = get_kademlia_peer_addresses(
+                            let mut addrs: HashSet<Multiaddr> = get_kademlia_peer_addresses(
                                 &mut swarm.behaviour_mut().kademlia,
                                 &p,
                             )
                             .into_iter()
                             .collect();
+
+                            // Also check stored provider records in local memory
+                            for rec in swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .store_mut()
+                                .providers(record_key)
+                            {
+                                if rec.provider == p {
+                                    addrs.extend(rec.addresses);
+                                }
+                            }
+
+                            // If we don't have addresses for this discovered peer, trigger a DHT lookup
+                            if addrs.is_empty() {
+                                let lookup_qid =
+                                    swarm.behaviour_mut().kademlia.get_closest_peers(p);
+                                peer_lookups.insert(lookup_qid, p);
+                                debug!(
+                                    "Triggered DHT peer address lookup for provider {} (Query ID: {:?})",
+                                    p, lookup_qid
+                                );
+                                let _ = swarm.dial(p);
+                            }
+
                             lock.entry(p).or_default().extend(addrs);
                         }
                     }
@@ -642,6 +757,35 @@ fn handle_kademlia_event(
                 }
                 kad::QueryResult::GetProviders(Err(e)) => {
                     warn!("DHT provider query {:?} returned: {:?}", id, e);
+                }
+                kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { key, peers })) => {
+                    debug!(
+                        "GetClosestPeers query {:?} completed for key with {} peers",
+                        id,
+                        peers.len()
+                    );
+                    if let Some(target_peer) = peer_lookups.remove(&id) {
+                        let addrs = get_kademlia_peer_addresses(
+                            &mut swarm.behaviour_mut().kademlia,
+                            &target_peer,
+                        );
+                        if !addrs.is_empty() {
+                            for search in pending_searches.values() {
+                                let mut lock = match search.providers.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                if let Some(peer_addrs) = lock.get_mut(&target_peer) {
+                                    peer_addrs.extend(addrs.clone());
+                                }
+                            }
+                        }
+                    }
+                    let _ = key;
+                }
+                kad::QueryResult::GetClosestPeers(Err(e)) => {
+                    debug!("GetClosestPeers query {:?} returned error: {:?}", id, e);
+                    peer_lookups.remove(&id);
                 }
                 kad::QueryResult::StartProviding(Ok(add_provider_ok)) => {
                     info!(
@@ -693,11 +837,19 @@ fn handle_kademlia_event(
             }
         }
         kad::Event::RoutingUpdated {
-            peer,
-            is_new_peer: true,
-            ..
+            peer, addresses, ..
         } => {
-            debug!("Kademlia routing table added new peer {}", peer);
+            let addrs: Vec<Multiaddr> = addresses.iter().cloned().collect();
+            // Update active searches with newly discovered addresses
+            for search in pending_searches.values() {
+                let mut lock = match search.providers.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if let Some(peer_addrs) = lock.get_mut(&peer) {
+                    peer_addrs.extend(addrs.clone());
+                }
+            }
         }
         _ => {}
     }
@@ -706,15 +858,16 @@ fn handle_kademlia_event(
 fn format_provider_results(
     providers_ref: &Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
 ) -> Vec<DiscoveredProvider> {
-    let map = providers_ref.lock().unwrap();
+    let map = match providers_ref.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let mut list = Vec::new();
     for (peer, addrs_set) in map.iter() {
         let mut addrs: Vec<Multiaddr> = addrs_set.iter().cloned().collect();
-        let ip_addresses = extract_ip_addresses(&addrs);
         addrs.sort();
         list.push(DiscoveredProvider {
             peer_id: peer.to_string(),
-            ip_addresses,
             addresses: addrs.into_iter().map(|a| a.to_string()).collect(),
         });
     }

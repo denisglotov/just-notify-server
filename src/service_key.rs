@@ -67,6 +67,91 @@ pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
     ip_list
 }
 
+use anyhow::Context;
+
+/// Normalizes an observed multiaddress from an Identify protocol message.
+/// Ephemeral outgoing ports are replaced with the node's configured listening ports.
+pub fn normalize_observed_address(
+    observed: &libp2p::Multiaddr,
+    tcp_port: u16,
+    quic_port: u16,
+) -> Option<libp2p::Multiaddr> {
+    let mut ip_part = None;
+    let mut is_quic = false;
+    let mut is_tcp = false;
+
+    for proto in observed.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if !ip.is_unspecified() && !ip.is_broadcast() {
+                    ip_part = Some(format!("/ip4/{}", ip));
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                if !ip.is_unspecified() {
+                    ip_part = Some(format!("/ip6/{}", ip));
+                }
+            }
+            libp2p::multiaddr::Protocol::Dns(dns)
+            | libp2p::multiaddr::Protocol::Dns4(dns)
+            | libp2p::multiaddr::Protocol::Dns6(dns)
+            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => {
+                ip_part = Some(format!("/dns4/{}", dns));
+            }
+            libp2p::multiaddr::Protocol::QuicV1 => {
+                is_quic = true;
+            }
+            libp2p::multiaddr::Protocol::Tcp(_) => {
+                is_tcp = true;
+            }
+            _ => {}
+        }
+    }
+
+    let base = ip_part?;
+    if is_quic {
+        format!("{}/udp/{}/quic-v1", base, quic_port).parse().ok()
+    } else if is_tcp {
+        format!("{}/tcp/{}", base, tcp_port).parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Loads a keypair from a file if it exists, or generates a new ed25519 keypair and saves it.
+/// If no path is provided, a new in-memory ed25519 keypair is generated.
+pub fn load_or_generate_keypair(
+    key_path: Option<&std::path::Path>,
+) -> anyhow::Result<libp2p::identity::Keypair> {
+    if let Some(path) = key_path {
+        if path.exists() {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read keypair file at '{}'", path.display()))?;
+            let keypair =
+                libp2p::identity::Keypair::from_protobuf_encoding(&bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decode keypair from '{}': {:?}",
+                        path.display(),
+                        e
+                    )
+                })?;
+            return Ok(keypair);
+        }
+
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        if let Ok(bytes) = keypair.to_protobuf_encoding() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(path, &bytes)
+                .with_context(|| format!("Failed to save keypair file to '{}'", path.display()))?;
+        }
+        Ok(keypair)
+    } else {
+        Ok(libp2p::identity::Keypair::generate_ed25519())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,10 +159,14 @@ mod tests {
 
     #[test]
     fn test_derive_service_multihash() {
-        let (cid1, mh1) = derive_service_multihash("dymka-just-notify");
-        let (cid2, mh2) = derive_service_multihash("dymka-just-notify");
+        let (cid1, mh1) = derive_service_multihash("org.dymka.just-notify-server");
+        let (cid2, mh2) = derive_service_multihash("org.dymka.just-notify-server");
 
         assert_eq!(cid1, cid2);
+        assert_eq!(
+            cid1.to_string(),
+            "bafkreic62cvyvkn5knp2gujymlpzd3y4brmdqlw42n52lt522an2xapsne"
+        );
         assert_eq!(mh1, mh2);
         assert_eq!(mh1.code(), 0x12);
     }
@@ -117,5 +206,41 @@ mod tests {
                 "ny5.bootstrap.libp2p.io".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_normalize_observed_address_tcp() {
+        let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/tcp/54358".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4001).unwrap();
+        assert_eq!(normalized.to_string(), "/ip4/136.169.50.80/tcp/4001");
+    }
+
+    #[test]
+    fn test_normalize_observed_address_quic() {
+        let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/udp/1027/quic-v1".parse().unwrap();
+        let normalized = normalize_observed_address(&observed, 4001, 4002).unwrap();
+        assert_eq!(
+            normalized.to_string(),
+            "/ip4/136.169.50.80/udp/4002/quic-v1"
+        );
+    }
+
+    #[test]
+    fn test_keypair_persistence() {
+        let temp_dir = std::env::temp_dir();
+        let key_file = temp_dir.join(format!(
+            "test_key_{}.key",
+            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
+        ));
+
+        let kp1 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let peer_id1 = libp2p::PeerId::from(kp1.public());
+
+        let kp2 = load_or_generate_keypair(Some(&key_file)).unwrap();
+        let peer_id2 = libp2p::PeerId::from(kp2.public());
+
+        assert_eq!(peer_id1, peer_id2);
+
+        let _ = std::fs::remove_file(&key_file);
     }
 }

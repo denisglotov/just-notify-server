@@ -22,6 +22,8 @@ async fn main() -> anyhow::Result<()> {
             service_name,
             reannounce_interval,
             bootstrap_nodes_file,
+            bootstrap_nodes,
+            key_file,
             log_level,
         } => {
             let filter = EnvFilter::builder()
@@ -45,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
                 service_name,
                 reannounce_interval,
                 bootstrap_nodes_file,
+                bootstrap_nodes,
+                key_file,
             )
             .await?;
         }

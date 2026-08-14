@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "ipfs-server")]
+#[command(name = "just-notify-server")]
 #[command(about = "IPFS-compatible libp2p server daemon and control CLI", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
@@ -22,11 +22,11 @@ pub enum Commands {
         quic_port: u16,
 
         /// Path to Unix Domain Socket for local IPC control
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
+        #[arg(long, default_value = "/tmp/just-notify-server.sock")]
         socket_path: PathBuf,
 
         /// Service name to automatically register on IPFS mainnet DHT
-        #[arg(long, default_value = "dymka-just-notify")]
+        #[arg(long, default_value = "org.dymka.just-notify-server")]
         service_name: String,
 
         /// Interval in seconds to re-announce service provider record to DHT
@@ -37,6 +37,14 @@ pub enum Commands {
         #[arg(long, default_value = "bootstrap_nodes.txt")]
         bootstrap_nodes_file: PathBuf,
 
+        /// Additional bootstrap multiaddress(es) or direct peer(s)
+        #[arg(long = "bootstrap-node", action = clap::ArgAction::Append)]
+        bootstrap_nodes: Vec<String>,
+
+        /// Path to ed25519 identity key file to persist node Peer ID across restarts
+        #[arg(long, default_value = "node.key")]
+        key_file: PathBuf,
+
         /// Tracing log level filter (e.g. info, debug, warn, trace)
         #[arg(long, default_value = "info")]
         log_level: String,
@@ -44,12 +52,12 @@ pub enum Commands {
 
     /// Search IPFS mainnet DHT for providers of a service or CID
     Search {
-        /// Target service name or CID to search for (defaults to "dymka-just-notify")
-        #[arg(default_value = "dymka-just-notify")]
+        /// Target service name or CID to search for
+        #[arg(default_value = "org.dymka.just-notify-server")]
         service_name: String,
 
         /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
+        #[arg(long, default_value = "/tmp/just-notify-server.sock")]
         socket_path: PathBuf,
 
         /// Search timeout in seconds
@@ -60,14 +68,14 @@ pub enum Commands {
     /// Query connected peers from the running daemon
     Peers {
         /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
+        #[arg(long, default_value = "/tmp/just-notify-server.sock")]
         socket_path: PathBuf,
     },
 
     /// Query node identity and routing table status from the daemon
     Info {
         /// Path to daemon Unix Domain Socket
-        #[arg(long, default_value = "/tmp/ipfs-server.sock")]
+        #[arg(long, default_value = "/tmp/just-notify-server.sock")]
         socket_path: PathBuf,
     },
 }

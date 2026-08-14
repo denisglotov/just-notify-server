@@ -1,5 +1,5 @@
 [package]
-name = "ipfs-server"
+name = "just-notify-server"
 version = "0.1.0"
 edition = "2021"
 description = "IPFS-compatible libp2p server daemon with UDS IPC and CLI control client"

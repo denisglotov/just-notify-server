@@ -30,7 +30,7 @@ pub async fn send_ipc_request(
 ) -> anyhow::Result<IpcResponse> {
     if !socket_path.exists() {
         anyhow::bail!(
-            "Daemon socket does not exist at '{}'. Please start the daemon first with: 'ipfs-server daemon'",
+            "Daemon socket does not exist at '{}'. Please start the daemon first with: 'just-notify-server daemon'",
             socket_path.display()
         );
     }
@@ -39,13 +39,19 @@ pub async fn send_ipc_request(
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             anyhow::bail!(
-                "Connection refused at '{}'. Is the daemon running? Start it with: 'ipfs-server daemon'",
+                "Connection refused at '{}'. Is the daemon running? Start it with: 'just-notify-server daemon'",
+                socket_path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "Daemon socket does not exist at '{}'. Please start the daemon first with: 'just-notify-server daemon'",
                 socket_path.display()
             );
         }
         Err(e) => return Err(e.into()),
     };
-    let mut framed = Framed::new(stream, LinesCodec::new());
+    let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(1024 * 1024));
 
     let json_req = serde_json::to_string(request)?;
     framed.send(json_req).await?;
