@@ -24,38 +24,8 @@ async fn main() -> anyhow::Result<()> {
     let socket_path = cli.socket_path;
 
     match cli.command {
-        Commands::Daemon {
-            tcp_port,
-            quic_port,
-            service_name,
-            reannounce_interval,
-            bootstrap_nodes_file,
-            bootstrap_nodes,
-            key_file,
-            max_connections,
-            max_connections_per_peer,
-            max_pending_incoming_connections,
-            max_pending_outgoing_connections,
-            max_provided_keys,
-            idle_connection_timeout,
-        } => {
-            let config = daemon::DaemonConfig {
-                tcp_port,
-                quic_port,
-                socket_path,
-                service_name,
-                reannounce_interval: std::time::Duration::from_secs(reannounce_interval),
-                bootstrap_nodes_file,
-                cli_bootstrap_nodes: bootstrap_nodes,
-                key_file,
-                max_connections,
-                max_connections_per_peer,
-                max_pending_incoming_connections,
-                max_pending_outgoing_connections,
-                max_provided_keys,
-                idle_connection_timeout: std::time::Duration::from_secs(idle_connection_timeout),
-            };
-            daemon::run_daemon(config).await?;
+        Commands::Daemon(args) => {
+            daemon::run_daemon(args.into_config(socket_path)).await?;
         }
 
         cmd => {

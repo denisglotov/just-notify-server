@@ -32,7 +32,7 @@ impl TryFrom<Commands> for IpcRequest {
             }),
             Commands::Peers => Ok(IpcRequest::Peers),
             Commands::Info => Ok(IpcRequest::Info),
-            daemon @ Commands::Daemon { .. } => Err(daemon),
+            daemon @ Commands::Daemon(..) => Err(daemon),
         }
     }
 }
