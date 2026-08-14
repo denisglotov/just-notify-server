@@ -9,7 +9,6 @@ use libp2p::{autonat, identify, kad, ping, Multiaddr, PeerId, Swarm, SwarmBuilde
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -81,9 +80,12 @@ struct DaemonState {
 }
 
 struct PendingSearch {
-    providers: Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
-    sender: oneshot::Sender<Vec<DiscoveredProvider>>,
+    providers: HashMap<PeerId, HashSet<Multiaddr>>,
+    responder: oneshot::Sender<IpcResponse>,
+    service_name: String,
+    cid: String,
     deadline: std::time::Instant,
+    timeout_duration: Duration,
 }
 
 enum DaemonEvent {
@@ -393,7 +395,30 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                         );
                     }
                     Some(DaemonEvent::SearchTimeout { query_id }) => {
-                        if state.pending_searches.remove(&query_id).is_some() {
+                        if let Some(pending) = state.pending_searches.remove(&query_id) {
+                            let providers = format_provider_results(&pending.providers);
+                            let response = if providers.is_empty() {
+                                IpcResponse::Error {
+                                    message: format!(
+                                        "Search timed out after {}s while querying IPFS DHT",
+                                        pending.timeout_duration.as_secs()
+                                    ),
+                                }
+                            } else {
+                                let payload = SearchResultPayload {
+                                    service: pending.service_name,
+                                    cid: pending.cid,
+                                    providers,
+                                    timed_out: true,
+                                };
+                                match serde_json::to_value(payload) {
+                                    Ok(val) => IpcResponse::Success { data: val },
+                                    Err(e) => IpcResponse::Error {
+                                        message: e.to_string(),
+                                    },
+                                }
+                            };
+                            let _ = pending.responder.send(response);
                             debug!("Cleaned up timed-out search query {:?}", query_id);
                         }
                     }
@@ -603,81 +628,25 @@ fn handle_ipc_request(
 
             let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(30));
             let deadline = std::time::Instant::now() + timeout_duration;
-            let (search_tx, search_rx) = oneshot::channel::<Vec<DiscoveredProvider>>();
-            let shared_providers = Arc::new(Mutex::new(initial_providers));
+
             pending_searches.insert(
                 query_id,
                 PendingSearch {
-                    providers: shared_providers.clone(),
-                    sender: search_tx,
+                    providers: initial_providers,
+                    responder,
+                    service_name: service_name.clone(),
+                    cid: cid.to_string(),
                     deadline,
+                    timeout_duration,
                 },
             );
 
-            let timeout_providers = shared_providers.clone();
             let event_tx = daemon_event_tx.clone();
 
-            // Spawn timeout task to complete search if DHT query finishes or times out
+            // Spawn timeout task to notify daemon event loop if search expires
             tokio::spawn(async move {
-                let result = tokio::time::timeout(timeout_duration, search_rx).await;
-                let response = match result {
-                    Ok(Ok(providers)) => {
-                        let payload = SearchResultPayload {
-                            service: service_name,
-                            cid: cid.to_string(),
-                            providers,
-                            timed_out: false,
-                        };
-                        match serde_json::to_value(payload) {
-                            Ok(val) => IpcResponse::Success { data: val },
-                            Err(e) => IpcResponse::Error {
-                                message: e.to_string(),
-                            },
-                        }
-                    }
-                    Ok(Err(_)) => {
-                        let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
-                        let providers = format_provider_results(&timeout_providers);
-                        let payload = SearchResultPayload {
-                            service: service_name,
-                            cid: cid.to_string(),
-                            providers,
-                            timed_out: false,
-                        };
-                        match serde_json::to_value(payload) {
-                            Ok(val) => IpcResponse::Success { data: val },
-                            Err(e) => IpcResponse::Error {
-                                message: e.to_string(),
-                            },
-                        }
-                    }
-                    Err(_) => {
-                        let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
-                        let providers = format_provider_results(&timeout_providers);
-                        if providers.is_empty() {
-                            IpcResponse::Error {
-                                message: format!(
-                                    "Search timed out after {}s while querying IPFS DHT",
-                                    timeout_duration.as_secs()
-                                ),
-                            }
-                        } else {
-                            let payload = SearchResultPayload {
-                                service: service_name,
-                                cid: cid.to_string(),
-                                providers,
-                                timed_out: true,
-                            };
-                            match serde_json::to_value(payload) {
-                                Ok(val) => IpcResponse::Success { data: val },
-                                Err(e) => IpcResponse::Error {
-                                    message: e.to_string(),
-                                },
-                            }
-                        }
-                    }
-                };
-                let _ = responder.send(response);
+                tokio::time::sleep(timeout_duration).await;
+                let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
             });
         }
     }
@@ -943,11 +912,7 @@ fn handle_kademlia_event(
                     ..
                 })) => {
                     debug!("Found {} provider(s) for query {:?}", providers.len(), id);
-                    if let Some(pending) = pending_searches.get(&id) {
-                        let mut lock = match pending.providers.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
+                    if let Some(pending) = pending_searches.get_mut(&id) {
                         for p in providers {
                             let mut addrs: HashSet<Multiaddr> = get_kademlia_peer_addresses(
                                 &mut swarm.behaviour_mut().kademlia,
@@ -980,7 +945,7 @@ fn handle_kademlia_event(
                                 let _ = swarm.dial(p);
                             }
 
-                            lock.entry(p).or_default().extend(addrs);
+                            pending.providers.entry(p).or_default().extend(addrs);
                         }
                     }
                 }
@@ -992,7 +957,7 @@ fn handle_kademlia_event(
                 kad::QueryResult::GetProviders(Err(e)) => {
                     warn!("DHT provider query {:?} returned: {:?}", id, e);
                 }
-                kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { key, peers })) => {
+                kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })) => {
                     debug!(
                         "GetClosestPeers query {:?} completed for key with {} peers",
                         id,
@@ -1005,7 +970,6 @@ fn handle_kademlia_event(
                         );
                         update_pending_searches_for_peer(pending_searches, &target_peer, &addrs);
                     }
-                    let _ = key;
                 }
                 kad::QueryResult::GetClosestPeers(Err(e)) => {
                     debug!("GetClosestPeers query {:?} returned error: {:?}", id, e);
@@ -1056,7 +1020,19 @@ fn handle_kademlia_event(
                         id,
                         provider_list.len()
                     );
-                    let _ = pending.sender.send(provider_list);
+                    let payload = SearchResultPayload {
+                        service: pending.service_name,
+                        cid: pending.cid,
+                        providers: provider_list,
+                        timed_out: false,
+                    };
+                    let response = match serde_json::to_value(payload) {
+                        Ok(val) => IpcResponse::Success { data: val },
+                        Err(e) => IpcResponse::Error {
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = pending.responder.send(response);
                 }
             }
         }
@@ -1084,25 +1060,17 @@ fn update_pending_searches_for_peer(
     if new_addrs.is_empty() {
         return;
     }
-    pending_searches.values().for_each(|search| {
-        let mut lock = search
-            .providers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(peer_addrs) = lock.get_mut(peer) {
+    pending_searches.values_mut().for_each(|search| {
+        if let Some(peer_addrs) = search.providers.get_mut(peer) {
             peer_addrs.extend(new_addrs.iter().cloned());
         }
     });
 }
 
 fn format_provider_results(
-    providers_ref: &Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
+    providers_map: &HashMap<PeerId, HashSet<Multiaddr>>,
 ) -> Vec<DiscoveredProvider> {
-    let map = providers_ref
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let mut list: Vec<_> = map
+    let mut list: Vec<_> = providers_map
         .iter()
         .map(|(peer, addrs_set)| {
             let mut addresses: Vec<String> = addrs_set.iter().map(|a| a.to_string()).collect();
@@ -1289,9 +1257,12 @@ mod tests {
         pending_searches.insert(
             dummy_qid1,
             PendingSearch {
-                providers: Arc::new(Mutex::new(HashMap::new())),
-                sender: tx1,
+                providers: HashMap::new(),
+                responder: tx1,
+                service_name: "test-service-1".to_string(),
+                cid: "test-cid-1".to_string(),
                 deadline: std::time::Instant::now() - Duration::from_secs(1),
+                timeout_duration: Duration::from_secs(30),
             },
         );
 
@@ -1299,9 +1270,12 @@ mod tests {
         pending_searches.insert(
             dummy_qid2,
             PendingSearch {
-                providers: Arc::new(Mutex::new(HashMap::new())),
-                sender: tx2,
+                providers: HashMap::new(),
+                responder: tx2,
+                service_name: "test-service-2".to_string(),
+                cid: "test-cid-2".to_string(),
                 deadline: std::time::Instant::now() + Duration::from_secs(60),
+                timeout_duration: Duration::from_secs(30),
             },
         );
 
@@ -1314,6 +1288,73 @@ mod tests {
         assert_eq!(pending_searches.len(), 1);
         assert!(pending_searches.contains_key(&dummy_qid2));
         assert!(!pending_searches.contains_key(&dummy_qid1));
+    }
+
+    #[test]
+    fn test_format_provider_results() {
+        let mut providers = HashMap::new();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+
+        let addr1: Multiaddr = "/ip4/198.51.100.1/tcp/4001".parse().unwrap();
+        let addr2: Multiaddr = "/ip4/198.51.100.2/tcp/4001".parse().unwrap();
+
+        let mut addrs1 = HashSet::new();
+        addrs1.insert(addr2.clone());
+        addrs1.insert(addr1.clone());
+        providers.insert(peer1, addrs1);
+
+        let mut addrs2 = HashSet::new();
+        addrs2.insert(addr1.clone());
+        providers.insert(peer2, addrs2);
+
+        let formatted = format_provider_results(&providers);
+        assert_eq!(formatted.len(), 2);
+        // Ensure deterministic ordering by peer_id
+        assert!(formatted[0].peer_id <= formatted[1].peer_id);
+        // Ensure addresses for each peer are sorted
+        for entry in &formatted {
+            let mut sorted_addrs = entry.addresses.clone();
+            sorted_addrs.sort();
+            assert_eq!(entry.addresses, sorted_addrs);
+        }
+    }
+
+    #[test]
+    fn test_update_pending_searches_for_peer_modifies_active_query() {
+        let mut pending_searches = HashMap::new();
+        let peer_id = PeerId::random();
+        let store = kad::store::MemoryStore::new(peer_id);
+        let mut kademlia = kad::Behaviour::new(peer_id, store);
+        let dummy_qid = kademlia.get_closest_peers(PeerId::random());
+        let (tx, _rx) = oneshot::channel();
+
+        let mut initial_providers = HashMap::new();
+        let target_peer = PeerId::random();
+        initial_providers.insert(target_peer, HashSet::new());
+
+        pending_searches.insert(
+            dummy_qid,
+            PendingSearch {
+                providers: initial_providers,
+                responder: tx,
+                service_name: "test-service".to_string(),
+                cid: "test-cid".to_string(),
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+                timeout_duration: Duration::from_secs(30),
+            },
+        );
+
+        let new_addr: Multiaddr = "/ip4/192.0.2.1/tcp/4001".parse().unwrap();
+        update_pending_searches_for_peer(
+            &mut pending_searches,
+            &target_peer,
+            std::slice::from_ref(&new_addr),
+        );
+
+        let pending = pending_searches.get(&dummy_qid).unwrap();
+        let peer_addrs = pending.providers.get(&target_peer).unwrap();
+        assert!(peer_addrs.contains(&new_addr));
     }
 
     #[test]
