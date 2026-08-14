@@ -259,6 +259,10 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    /// Validates deterministic SHA2-256 multihash and CIDv1 derivation from arbitrary service name strings.
+    ///
+    /// - Guarantees consistent IPFS content addressing across different daemon instances and CLI calls.
+    /// - Ensures provider advertisements and query searches map to the exact same DHT record key (code 0x12, raw multihash).
     #[test]
     fn test_derive_service_multihash() {
         let (cid1, mh1) = derive_service_multihash("org.dymka.just-notify-server");
@@ -273,6 +277,10 @@ mod tests {
         assert_eq!(mh1.code(), 0x12);
     }
 
+    /// Verifies that valid existing CID strings are passed through without re-hashing.
+    ///
+    /// - Allows users to query or advertise directly by raw IPFS CID string in addition to service names.
+    /// - Prevents accidental double-hashing of valid IPFS CIDs.
     #[test]
     fn test_valid_cid_passthrough() {
         let cid_str = "bafybeicg253nyacwgahb3h4q6tx5v23e6qyr2m4eecw6srm6f3r7w3m2py";
@@ -280,6 +288,10 @@ mod tests {
         assert_eq!(cid.to_string(), cid_str);
     }
 
+    /// Validates extracting PeerId from libp2p multiaddresses containing `/p2p/<PeerId>`.
+    ///
+    /// - Essential for parsing bootstrap node lists and peer addresses with embedded peer identities.
+    /// - Ensures correct extraction for establishing direct Kademlia dials.
     #[test]
     fn test_extract_peer_id() {
         let addr_str =
@@ -292,6 +304,10 @@ mod tests {
         );
     }
 
+    /// Verifies extraction, deduplication, and sorting of host IPs and DNS names from diverse multiaddresses.
+    ///
+    /// - Formats discovered provider addresses and peer lists into human-readable IP and DNS listings.
+    /// - Prevents duplicate addresses when a peer supports multiple transport protocols (e.g. TCP + QUIC) on the same IP.
     #[test]
     fn test_extract_ip_addresses() {
         let addr1: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
@@ -316,6 +332,10 @@ mod tests {
         );
     }
 
+    /// Verifies that observed TCP multiaddresses with ephemeral NAT ports are normalized to the daemon's listening TCP port.
+    ///
+    /// - In NAT environments, remote peers observe outgoing ephemeral source ports rather than listening ports.
+    /// - Normalization ensures remote peers can dial back to our actual listening port.
     #[test]
     fn test_normalize_observed_address_tcp() {
         let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/tcp/54358".parse().unwrap();
@@ -323,6 +343,9 @@ mod tests {
         assert_eq!(normalized.to_string(), "/ip4/136.169.50.80/tcp/4001");
     }
 
+    /// Verifies that observed QUIC multiaddresses (`/udp/<port>/quic-v1`) are normalized to the daemon's listening QUIC port.
+    ///
+    /// - Ensures QUIC transport addresses retain the correct UDP port and QUIC-v1 protocol identifier when discovered via AutoNAT/Identify.
     #[test]
     fn test_normalize_observed_address_quic() {
         let observed: libp2p::Multiaddr = "/ip4/136.169.50.80/udp/1027/quic-v1".parse().unwrap();
@@ -333,6 +356,9 @@ mod tests {
         );
     }
 
+    /// Verifies IPv6 address handling and port normalization.
+    ///
+    /// - Ensures dual-stack / IPv6 public addresses are properly identified and formatted with the correct port.
     #[test]
     fn test_normalize_observed_address_ipv6() {
         let observed: libp2p::Multiaddr = "/ip6/2600:1900::1/tcp/54358".parse().unwrap();
@@ -340,6 +366,9 @@ mod tests {
         assert_eq!(normalized.to_string(), "/ip6/2600:1900::1/tcp/4001");
     }
 
+    /// Verifies normalization across domain-based protocols (`/dns4/`, `/dns6/`, `/dnsaddr/`).
+    ///
+    /// - Ensures bootstrap nodes and domain-based addresses are properly normalized and validated against public DNS rules.
     #[test]
     fn test_normalize_observed_address_dns_protocols() {
         let obs_dns4: libp2p::Multiaddr = "/dns4/bootstrap.libp2p.io/tcp/54358".parse().unwrap();
@@ -370,6 +399,11 @@ mod tests {
         );
     }
 
+    /// Comprehensive verification of public routable IPv4 address classification.
+    ///
+    /// - Guards against advertising invalid or non-routable addresses to the public DHT.
+    /// - Verifies filtering for RFC 1918 (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10),
+    ///   loopback (127/8), link-local (169.254/16), documentation, multicast, and broadcast ranges.
     #[test]
     fn test_is_public_routable_ipv4() {
         use std::net::Ipv4Addr;
@@ -406,6 +440,9 @@ mod tests {
         assert!(!is_public_routable_ipv4(Ipv4Addr::new(240, 0, 0, 1)));
     }
 
+    /// Verifies that private and loopback multiaddresses are rejected during address normalization.
+    ///
+    /// - Prevents local network addresses from being registered as candidate external addresses.
     #[test]
     fn test_normalize_observed_address_rejects_private() {
         // Private 10.x IP (like the observed 10.60.7.102)
@@ -425,6 +462,10 @@ mod tests {
         assert!(normalize_observed_address(&observed_cgnat, 4001, 4001).is_none());
     }
 
+    /// Verifies persisting and reloading an Ed25519 keypair from disk.
+    ///
+    /// - Ensures node identity (PeerId) remains stable and deterministic across server restarts.
+    /// - Verifies key serialization and file loading roundtrips properly.
     #[test]
     fn test_keypair_persistence() {
         let temp_dir = std::env::temp_dir();

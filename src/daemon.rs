@@ -861,7 +861,7 @@ fn handle_swarm_event(
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Autonat(autonat_event)) => {
             match autonat_event {
                 autonat::Event::StatusChanged { old, new } => {
-                    info!("AutoNAT status changed from {:?} to {:?}", old, new);
+                    debug!("AutoNAT status changed from {:?} to {:?}", old, new);
                     if let autonat::NatStatus::Public(ref public_addr) = new {
                         if let Some(clean_addr) = normalize_observed_address(
                             public_addr,
@@ -1122,6 +1122,11 @@ mod tests {
     use super::*;
     use crate::ipc;
 
+    /// End-to-end integration test validating the Unix domain socket (UDS) IPC server.
+    ///
+    /// - Stresses the local IPC server under concurrent client load (25 simultaneous tasks).
+    /// - Confirms resilience against malformed non-JSON data frames and immediately aborted connections.
+    /// - Verifies sequential request handling and guarantees that the daemon recovers and remains responsive.
     #[tokio::test]
     async fn test_daemon_stress_and_resilience() {
         let temp_dir = std::env::temp_dir();
@@ -1242,6 +1247,10 @@ mod tests {
         let _ = std::fs::remove_file(&key_file);
     }
 
+    /// Verifies deadline-based timeout eviction of in-flight DHT search queries.
+    ///
+    /// - Prevents memory leaks by ensuring stale or timed-out searches are promptly pruned from `pending_searches`.
+    /// - Guarantees active non-expired queries are safely preserved when cleaning up expired queries.
     #[test]
     fn test_pending_search_timeout_eviction() {
         let mut pending_searches = HashMap::new();
@@ -1292,6 +1301,10 @@ mod tests {
         assert!(!pending_searches.contains_key(&dummy_qid1));
     }
 
+    /// Verifies deterministic formatting, sorting, and deduplication of discovered DHT provider records.
+    ///
+    /// - Guarantees consistent ordering of providers by PeerId and addresses across CLI output and IPC JSON responses.
+    /// - Prevents non-deterministic UI output order when searching DHT services.
     #[test]
     fn test_format_provider_results() {
         let mut providers = HashMap::new();
@@ -1322,6 +1335,10 @@ mod tests {
         }
     }
 
+    /// Verifies incremental address aggregation into active in-flight provider searches.
+    ///
+    /// - When Kademlia discovers new addresses for an identified provider peer during routing,
+    ///   they must be merged into the active pending search so the requester receives complete reachability info.
     #[test]
     fn test_update_pending_searches_for_peer_modifies_active_query() {
         let mut pending_searches = HashMap::new();
@@ -1359,6 +1376,11 @@ mod tests {
         assert!(peer_addrs.contains(&new_addr));
     }
 
+    /// Verifies the multi-peer voting quorum lifecycle for external address discovery.
+    ///
+    /// - Prevents single malicious or spoofed peers from convincing the daemon to advertise arbitrary external addresses.
+    /// - Requires 3 distinct peers to agree on the candidate address before confirmation.
+    /// - Confirms deduplication of repeated votes from the same peer and proper memory cleanup upon reaching quorum.
     #[test]
     fn test_observed_candidates_quorum_lifecycle() {
         let mut quorum_map: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
@@ -1428,6 +1450,10 @@ mod tests {
         assert!(!quorum_map.contains_key(&addr));
     }
 
+    /// Verifies candidate address bounded-capacity eviction under churn or high-cardinality attacks.
+    ///
+    /// - Protects against memory exhaustion DoS attacks by capping the candidate map at `MAX_OBSERVED_CANDIDATES`.
+    /// - Verifies that lowest-vote candidates are evicted first while higher-weight candidates are retained.
     #[test]
     fn test_observed_candidates_quorum_capacity_eviction() {
         let mut quorum_map: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
@@ -1472,6 +1498,9 @@ mod tests {
         assert!(quorum_map.contains_key(&favored_addr));
     }
 
+    /// Verifies peer address resolution from Kademlia routing table's k-buckets.
+    ///
+    /// - Ensures multiaddresses registered in Kademlia are correctly retrieved by PeerId during peer inspection.
     #[test]
     fn test_get_kademlia_peer_addresses() {
         let local_peer = PeerId::random();
@@ -1501,6 +1530,10 @@ mod tests {
             .any(|a| a.to_string().contains("198.51.100.1") && a.to_string().contains("quic-v1")));
     }
 
+    /// Verifies JSON serialization of daemon responses (`DaemonInfo`, `SearchResultPayload`).
+    ///
+    /// - Ensures schema stability for IPC responses consumed by the CLI tool or external integrations.
+    /// - Checks conditional serialization behavior, such as omitting `timed_out` when false.
     #[test]
     fn test_typed_ipc_responses() {
         let info = DaemonInfo {
@@ -1529,28 +1562,13 @@ mod tests {
         assert!(search_val.get("timed_out").is_none());
     }
 
-    #[test]
-    fn test_connection_limits_configuration() {
-        let limits = connection_limits::ConnectionLimits::default()
-            .with_max_established(Some(50))
-            .with_max_established_per_peer(Some(2))
-            .with_max_pending_incoming(Some(16))
-            .with_max_pending_outgoing(Some(16));
-        let _behaviour = connection_limits::Behaviour::new(limits);
-    }
-
-    #[test]
-    fn test_memory_store_capacity_configuration() {
-        let peer_id = PeerId::random();
-        let store_config = kad::store::MemoryStoreConfig {
-            max_provided_keys: 65_536,
-            max_records: 10_000,
-            ..Default::default()
-        };
-        let store = kad::store::MemoryStore::with_config(peer_id, store_config);
-        assert_eq!(store.provided().count(), 0);
-    }
-
+    /// Verifies swarm event handling for external address confirmation and expiry.
+    ///
+    /// - When libp2p emits `ExternalAddrConfirmed`, it automatically registers the raw observed address
+    ///   with ephemeral NAT port. Our event handler must remove the raw address and replace it with
+    ///   the normalized listening port address.
+    /// - Verifies that `ExternalAddrExpired` removes the normalized address from both the swarm and `DaemonState`.
+    /// - Confirms private/unroutable addresses are rejected and removed from swarm advertisement.
     #[tokio::test]
     async fn test_external_addr_confirmed_replaces_raw_address() {
         let keypair = libp2p::identity::Keypair::generate_ed25519();

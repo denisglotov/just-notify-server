@@ -88,6 +88,11 @@ pub async fn send_ipc_request(
 mod tests {
     use super::*;
 
+    /// Verifies JSON wire protocol serialization and deserialization for IPC search queries.
+    ///
+    /// - Guards against wire protocol regressions between the CLI client and the background daemon.
+    /// - Ensures backward compatibility with legacy clients that omit optional fields like `timeout_secs`,
+    ///   confirming they default to `None` without parsing errors.
     #[test]
     fn test_ipc_request_search_serde() {
         let req_with_timeout = IpcRequest::Search {
@@ -122,6 +127,11 @@ mod tests {
         }
     }
 
+    /// Verifies translation from CLI command enum variants into IPC request payloads.
+    ///
+    /// - Ensures CLI subcommands (`search`, `peers`, `info`) are correctly transformed into their
+    ///   matching IPC network messages with appropriate parameter passing (e.g. search timeout).
+    /// - Prevents accidental dispatch of daemon-only commands across IPC.
     #[test]
     fn test_ipc_request_from_commands() {
         let search_cmd = Commands::Search {
