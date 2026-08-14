@@ -210,7 +210,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             // AutoNAT
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
 
-            // Connection Limits
+            // Connection Limits (must be first in AppBehaviour)
             let limits = connection_limits::ConnectionLimits::default()
                 .with_max_established(Some(config.max_connections))
                 .with_max_established_per_peer(Some(config.max_connections_per_peer))
@@ -219,11 +219,11 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             let connection_limits = connection_limits::Behaviour::new(limits);
 
             Ok(AppBehaviour {
+                connection_limits,
                 kademlia,
                 identify,
                 ping,
                 autonat,
-                connection_limits,
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
