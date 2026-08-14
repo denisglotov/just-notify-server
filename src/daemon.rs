@@ -767,13 +767,15 @@ fn handle_swarm_event(
             info!("Listening on multiaddress: {}", address);
         }
         libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
+            // Remove the raw (potentially ephemeral-port) address automatically registered by libp2p swarm
+            // before adding the normalized address, preventing unreachable ephemeral ports from being advertised.
+            swarm.remove_external_address(&address);
             if let Some(clean_addr) =
                 normalize_observed_address(&address, config.tcp_port, config.quic_port)
             {
                 state.observed_candidates_quorum.remove(&clean_addr);
                 if state.known_external_addrs.insert(clean_addr.clone()) {
                     info!("Confirmed external public address: {}", clean_addr);
-                    swarm.add_external_address(clean_addr);
                     if let Err(e) = swarm
                         .behaviour_mut()
                         .kademlia
@@ -782,9 +784,11 @@ fn handle_swarm_event(
                         debug!("Start providing on external address confirmation: {:?}", e);
                     }
                 }
+                swarm.add_external_address(clean_addr);
             }
         }
         libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
+            swarm.remove_external_address(&address);
             if let Some(clean_addr) =
                 normalize_observed_address(&address, config.tcp_port, config.quic_port)
             {
@@ -1515,5 +1519,99 @@ mod tests {
         };
         let store = kad::store::MemoryStore::with_config(peer_id, store_config);
         assert_eq!(store.provided().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_external_addr_confirmed_replaces_raw_address() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let config = DaemonConfig {
+            tcp_port: 4001,
+            quic_port: 4001,
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            service_name: "test-service".to_string(),
+            reannounce_interval: Duration::from_secs(3600),
+            bootstrap_nodes_file: PathBuf::from("non_existent.txt"),
+            cli_bootstrap_nodes: vec![],
+            key_file: PathBuf::from("/tmp/test.key"),
+            max_connections: 100,
+            max_connections_per_peer: 3,
+            max_pending_incoming_connections: 64,
+            max_pending_outgoing_connections: 64,
+            max_provided_keys: 65_536,
+        };
+
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .unwrap()
+            .with_quic()
+            .with_behaviour(|key| {
+                let peer_id = key.public().to_peer_id();
+                let store = kad::store::MemoryStore::new(peer_id);
+                let kademlia = kad::Behaviour::new(peer_id, store);
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    "/ipfs/1.0.0".to_string(),
+                    key.public(),
+                ));
+                let ping = ping::Behaviour::new(ping::Config::new());
+                let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+                let limits = connection_limits::ConnectionLimits::default();
+                let connection_limits = connection_limits::Behaviour::new(limits);
+                Ok(AppBehaviour {
+                    connection_limits,
+                    kademlia,
+                    identify,
+                    ping,
+                    autonat,
+                })
+            })
+            .unwrap()
+            .build();
+
+        let mut state = DaemonState::default();
+        let record_key = kad::RecordKey::new(&b"test_record_key");
+
+        let raw_addr: Multiaddr = "/ip4/1.2.3.4/tcp/54321".parse().unwrap();
+        let normalized_addr: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
+
+        // Simulate libp2p swarm having already registered the raw address before emitting ExternalAddrConfirmed
+        swarm.add_external_address(raw_addr.clone());
+        assert!(swarm.external_addresses().any(|a| a == &raw_addr));
+
+        // Fire ExternalAddrConfirmed
+        let event = libp2p::swarm::SwarmEvent::ExternalAddrConfirmed {
+            address: raw_addr.clone(),
+        };
+        handle_swarm_event(event, &mut swarm, &mut state, &record_key, &config);
+
+        // Verify raw address was removed and normalized address was added
+        let ext_addrs: Vec<Multiaddr> = swarm.external_addresses().cloned().collect();
+        assert!(!ext_addrs.contains(&raw_addr), "Raw address must be removed from swarm");
+        assert!(ext_addrs.contains(&normalized_addr), "Normalized address must be added to swarm");
+        assert!(state.known_external_addrs.contains(&normalized_addr));
+
+        // Fire ExternalAddrExpired
+        let expire_event = libp2p::swarm::SwarmEvent::ExternalAddrExpired {
+            address: raw_addr.clone(),
+        };
+        handle_swarm_event(expire_event, &mut swarm, &mut state, &record_key, &config);
+
+        let ext_addrs_after: Vec<Multiaddr> = swarm.external_addresses().cloned().collect();
+        assert!(!ext_addrs_after.contains(&normalized_addr), "Normalized address must be removed on expiry");
+        assert!(!state.known_external_addrs.contains(&normalized_addr));
+
+        // Verify unroutable / private address is removed and not added as external
+        let private_addr: Multiaddr = "/ip4/192.168.1.50/tcp/4001".parse().unwrap();
+        swarm.add_external_address(private_addr.clone());
+        assert!(swarm.external_addresses().any(|a| a == &private_addr));
+        let event_private = libp2p::swarm::SwarmEvent::ExternalAddrConfirmed {
+            address: private_addr.clone(),
+        };
+        handle_swarm_event(event_private, &mut swarm, &mut state, &record_key, &config);
+        assert!(!swarm.external_addresses().any(|a| a == &private_addr), "Private address must be removed from swarm");
     }
 }
