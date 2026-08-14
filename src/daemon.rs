@@ -52,6 +52,27 @@ pub struct SearchResultPayload {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    pub tcp_port: u16,
+    pub quic_port: u16,
+    pub socket_path: PathBuf,
+    pub service_name: String,
+    pub reannounce_interval: Duration,
+    pub bootstrap_nodes_file: PathBuf,
+    pub cli_bootstrap_nodes: Vec<String>,
+    pub key_file: PathBuf,
+}
+
+#[derive(Default)]
+struct DaemonState {
+    pending_searches: HashMap<kad::QueryId, PendingSearch>,
+    peer_lookups: HashMap<kad::QueryId, PeerId>,
+    known_external_addrs: HashSet<Multiaddr>,
+    observed_candidates_quorum: HashMap<Multiaddr, HashSet<PeerId>>,
+    bootstrapped: bool,
+}
+
 struct PendingSearch {
     providers: Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
     sender: oneshot::Sender<Vec<DiscoveredProvider>>,
@@ -130,24 +151,14 @@ fn load_bootstrap_nodes(
     Ok(all_nodes)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_daemon(
-    tcp_port: u16,
-    quic_port: u16,
-    socket_path: PathBuf,
-    service_name: String,
-    reannounce_interval_secs: u64,
-    bootstrap_nodes_file: PathBuf,
-    cli_bootstrap_nodes: Vec<String>,
-    key_file: PathBuf,
-) -> anyhow::Result<()> {
+pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     info!("Starting IPFS libp2p server daemon...");
 
     // Load or generate identity keypair
-    let local_key = service_key::load_or_generate_keypair(Some(&key_file))?;
+    let local_key = service_key::load_or_generate_keypair(Some(&config.key_file))?;
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local Peer ID: {}", local_peer_id);
-    info!("Node identity persisted at: {}", key_file.display());
+    info!("Node identity persisted at: {}", config.key_file.display());
 
     // Build swarm with TCP + DNS + QUIC transports
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
@@ -169,9 +180,7 @@ pub async fn run_daemon(
             if let Some(replication) = std::num::NonZeroUsize::new(20) {
                 kad_config.set_replication_factor(replication);
             }
-            kad_config.set_provider_publication_interval(Some(Duration::from_secs(
-                reannounce_interval_secs,
-            )));
+            kad_config.set_provider_publication_interval(Some(config.reannounce_interval));
             let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
 
@@ -198,30 +207,30 @@ pub async fn run_daemon(
         .build();
 
     // Clean up existing UDS socket file if present and ensure directory exists
-    if let Some(parent) = socket_path.parent() {
+    if let Some(parent) = config.socket_path.parent() {
         if !parent.exists() {
             let _ = std::fs::create_dir_all(parent);
         }
     }
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
+    if config.socket_path.exists() {
+        let _ = std::fs::remove_file(&config.socket_path);
     }
 
-    let ipc_listener = UnixListener::bind(&socket_path).with_context(|| {
+    let ipc_listener = UnixListener::bind(&config.socket_path).with_context(|| {
         format!(
             "Failed to bind Unix Domain Socket at {}",
-            socket_path.display()
+            config.socket_path.display()
         )
     })?;
 
     // RAII Guard to guarantee socket deletion on any exit or drop
     let _socket_guard = SocketCleanupGuard {
-        path: socket_path.clone(),
+        path: config.socket_path.clone(),
     };
 
     info!(
         "IPC Unix Domain Socket listening at {}",
-        socket_path.display()
+        config.socket_path.display()
     );
 
     // MPSC channel to receive IPC events from async socket tasks
@@ -250,16 +259,17 @@ pub async fn run_daemon(
     });
 
     // Listen on TCP multiaddress
-    let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", tcp_port).parse()?;
+    let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.tcp_port).parse()?;
     swarm.listen_on(tcp_addr.clone())?;
     info!("Listening for P2P TCP connections on {}", tcp_addr);
 
     // Listen on QUIC multiaddress
-    let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", quic_port).parse()?;
+    let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.quic_port).parse()?;
     swarm.listen_on(quic_addr.clone())?;
     info!("Listening for P2P QUIC connections on {}", quic_addr);
 
-    let bootstrap_addrs = load_bootstrap_nodes(&bootstrap_nodes_file, &cli_bootstrap_nodes)?;
+    let bootstrap_addrs =
+        load_bootstrap_nodes(&config.bootstrap_nodes_file, &config.cli_bootstrap_nodes)?;
     info!("Bootstrapping into IPFS / libp2p network...");
     for addr_str in &bootstrap_addrs {
         match addr_str.parse::<Multiaddr>() {
@@ -289,11 +299,11 @@ pub async fn run_daemon(
     }
 
     // Register service provider record ("org.dymka.just-notify-server")
-    let (service_cid, service_mhash) = service_key::derive_service_multihash(&service_name);
+    let (service_cid, service_mhash) = service_key::derive_service_multihash(&config.service_name);
     let record_key = kad::RecordKey::new(&service_mhash.to_bytes());
     info!(
         "Configured provider record for service '{}' (CID: {}) on IPFS DHT",
-        service_name, service_cid
+        config.service_name, service_cid
     );
 
     // Progressive re-announcement delays for initial warmup: 3s, 10s, 30s, 60s, 120s
@@ -302,11 +312,7 @@ pub async fn run_daemon(
     let mut next_reannounce =
         tokio::time::Instant::now() + Duration::from_secs(progressive_delays[0]);
 
-    let mut pending_searches: HashMap<kad::QueryId, PendingSearch> = HashMap::new();
-    let mut peer_lookups: HashMap<kad::QueryId, PeerId> = HashMap::new();
-    let mut known_external_addrs: HashSet<Multiaddr> = HashSet::new();
-    let mut observed_candidates_quorum: HashMap<Multiaddr, HashSet<PeerId>> = HashMap::new();
-    let mut bootstrapped = false;
+    let mut state = DaemonState::default();
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -338,7 +344,7 @@ pub async fn run_daemon(
 
             // Progressive and periodic service re-announcements
             _ = tokio::time::sleep_until(next_reannounce) => {
-                info!("Announcing service '{}' provider record to IPFS DHT", service_name);
+                info!("Announcing service '{}' provider record to IPFS DHT", config.service_name);
                 if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(record_key.clone()) {
                     debug!("Provider announcement query error: {:?}", e);
                 }
@@ -348,7 +354,7 @@ pub async fn run_daemon(
                     progressive_idx += 1;
                     next_reannounce = tokio::time::Instant::now() + Duration::from_secs(progressive_delays[progressive_idx]);
                 } else {
-                    next_reannounce = tokio::time::Instant::now() + Duration::from_secs(reannounce_interval_secs);
+                    next_reannounce = tokio::time::Instant::now() + config.reannounce_interval;
                 }
             }
 
@@ -361,13 +367,13 @@ pub async fn run_daemon(
                             responder,
                             &mut swarm,
                             local_peer_id,
-                            &service_name,
-                            &mut pending_searches,
+                            &config.service_name,
+                            &mut state.pending_searches,
                             ipc_tx.clone(),
                         );
                     }
                     Some(DaemonEvent::SearchTimeout { query_id }) => {
-                        if pending_searches.remove(&query_id).is_some() {
+                        if state.pending_searches.remove(&query_id).is_some() {
                             debug!("Cleaned up timed-out search query {:?}", query_id);
                         }
                     }
@@ -382,15 +388,9 @@ pub async fn run_daemon(
                 handle_swarm_event(
                     event,
                     &mut swarm,
-                    &mut pending_searches,
-                    &mut peer_lookups,
-                    &mut known_external_addrs,
-                    &mut observed_candidates_quorum,
-                    &mut bootstrapped,
+                    &mut state,
                     &record_key,
-                    &service_name,
-                    tcp_port,
-                    quic_port,
+                    &config,
                 );
             }
         }
@@ -722,28 +722,23 @@ fn record_observed_candidate_address(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: libp2p::swarm::SwarmEvent<AppBehaviourEvent>,
     swarm: &mut Swarm<AppBehaviour>,
-    pending_searches: &mut HashMap<kad::QueryId, PendingSearch>,
-    peer_lookups: &mut HashMap<kad::QueryId, PeerId>,
-    known_external_addrs: &mut HashSet<Multiaddr>,
-    observed_candidates_quorum: &mut HashMap<Multiaddr, HashSet<PeerId>>,
-    bootstrapped: &mut bool,
+    state: &mut DaemonState,
     record_key: &kad::RecordKey,
-    service_name: &str,
-    tcp_port: u16,
-    quic_port: u16,
+    config: &DaemonConfig,
 ) {
     match event {
         libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
             info!("Listening on multiaddress: {}", address);
         }
         libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-            if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
-                observed_candidates_quorum.remove(&clean_addr);
-                if known_external_addrs.insert(clean_addr.clone()) {
+            if let Some(clean_addr) =
+                normalize_observed_address(&address, config.tcp_port, config.quic_port)
+            {
+                state.observed_candidates_quorum.remove(&clean_addr);
+                if state.known_external_addrs.insert(clean_addr.clone()) {
                     info!("Confirmed external public address: {}", clean_addr);
                     swarm.add_external_address(clean_addr);
                     if let Err(e) = swarm
@@ -757,9 +752,11 @@ fn handle_swarm_event(
             }
         }
         libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
-            if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
-                known_external_addrs.remove(&clean_addr);
-                observed_candidates_quorum.remove(&clean_addr);
+            if let Some(clean_addr) =
+                normalize_observed_address(&address, config.tcp_port, config.quic_port)
+            {
+                state.known_external_addrs.remove(&clean_addr);
+                state.observed_candidates_quorum.remove(&clean_addr);
                 swarm.remove_external_address(&clean_addr);
                 info!("External public address expired: {}", clean_addr);
             }
@@ -786,10 +783,10 @@ fn handle_swarm_event(
             handle_kademlia_event(
                 kad_event,
                 swarm,
-                pending_searches,
-                peer_lookups,
+                &mut state.pending_searches,
+                &mut state.peer_lookups,
                 record_key,
-                service_name,
+                &config.service_name,
             );
         }
         libp2p::swarm::SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
@@ -802,11 +799,11 @@ fn handle_swarm_event(
 
             // Normalize observed external address to verify public routability
             if let Some(clean_addr) =
-                normalize_observed_address(&info.observed_addr, tcp_port, quic_port)
+                normalize_observed_address(&info.observed_addr, config.tcp_port, config.quic_port)
             {
                 if let Some((confirmed_addr, quorum_count)) = record_observed_candidate_address(
-                    observed_candidates_quorum,
-                    known_external_addrs,
+                    &mut state.observed_candidates_quorum,
+                    &mut state.known_external_addrs,
                     clean_addr,
                     peer_id,
                 ) {
@@ -829,7 +826,11 @@ fn handle_swarm_event(
             }
 
             // Update any active search that is waiting for this peer's addresses
-            update_pending_searches_for_peer(pending_searches, &peer_id, &info.listen_addrs);
+            update_pending_searches_for_peer(
+                &mut state.pending_searches,
+                &peer_id,
+                &info.listen_addrs,
+            );
 
             // Kademlia requires insertion of discovered peers into its routing table
             for addr in info.listen_addrs {
@@ -837,14 +838,14 @@ fn handle_swarm_event(
             }
 
             // Once we have identified a peer, trigger routing table bootstrap if not already started
-            if !*bootstrapped {
+            if !state.bootstrapped {
                 match swarm.behaviour_mut().kademlia.bootstrap() {
                     Ok(qid) => {
                         info!(
                             "Triggered Kademlia DHT routing table bootstrap (Query ID: {:?})",
                             qid
                         );
-                        *bootstrapped = true;
+                        state.bootstrapped = true;
                     }
                     Err(e) => {
                         debug!("Kademlia bootstrap trigger on identify info: {:?}", e);
@@ -857,11 +858,13 @@ fn handle_swarm_event(
                 autonat::Event::StatusChanged { old, new } => {
                     info!("AutoNAT status changed from {:?} to {:?}", old, new);
                     if let autonat::NatStatus::Public(ref public_addr) = new {
-                        if let Some(clean_addr) =
-                            normalize_observed_address(public_addr, tcp_port, quic_port)
-                        {
-                            observed_candidates_quorum.remove(&clean_addr);
-                            if known_external_addrs.insert(clean_addr.clone()) {
+                        if let Some(clean_addr) = normalize_observed_address(
+                            public_addr,
+                            config.tcp_port,
+                            config.quic_port,
+                        ) {
+                            state.observed_candidates_quorum.remove(&clean_addr);
+                            if state.known_external_addrs.insert(clean_addr.clone()) {
                                 info!("AutoNAT confirmed public external address: {}", clean_addr);
                                 swarm.add_external_address(clean_addr);
                                 if let Err(e) = swarm
@@ -1128,20 +1131,20 @@ mod tests {
         let sock_clone = socket_path.clone();
         let key_clone = key_file.clone();
         let daemon_handle = tokio::spawn(async move {
-            let res = run_daemon(
-                0,
-                0,
-                sock_clone,
-                "test-service".to_string(),
-                3600,
-                PathBuf::from("non_existent_bootstrap.txt"),
-                vec![
+            let config = DaemonConfig {
+                tcp_port: 0,
+                quic_port: 0,
+                socket_path: sock_clone,
+                service_name: "test-service".to_string(),
+                reannounce_interval: Duration::from_secs(3600),
+                bootstrap_nodes_file: PathBuf::from("non_existent_bootstrap.txt"),
+                cli_bootstrap_nodes: vec![
                     "/ip4/127.0.0.1/tcp/49999/p2p/QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
                         .to_string(),
                 ],
-                key_clone,
-            )
-            .await;
+                key_file: key_clone,
+            };
+            let res = run_daemon(config).await;
             if let Err(e) = res {
                 eprintln!("run_daemon returned error: {:?}", e);
             }

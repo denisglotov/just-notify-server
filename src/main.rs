@@ -33,17 +33,17 @@ async fn main() -> anyhow::Result<()> {
             bootstrap_nodes,
             key_file,
         } => {
-            daemon::run_daemon(
+            let config = daemon::DaemonConfig {
                 tcp_port,
                 quic_port,
                 socket_path,
                 service_name,
-                reannounce_interval,
+                reannounce_interval: std::time::Duration::from_secs(reannounce_interval),
                 bootstrap_nodes_file,
-                bootstrap_nodes,
+                cli_bootstrap_nodes: bootstrap_nodes,
                 key_file,
-            )
-            .await?;
+            };
+            daemon::run_daemon(config).await?;
         }
 
         cmd => {
