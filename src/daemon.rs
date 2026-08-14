@@ -164,7 +164,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     info!("Starting IPFS libp2p server daemon...");
 
     // Load or generate identity keypair
-    let local_key = service_key::load_or_generate_keypair(Some(&config.key_file))?;
+    let local_key = service_key::load_or_generate_keypair(&config.key_file)?;
     let local_peer_id = PeerId::from(local_key.public());
     info!("Local Peer ID: {}", local_peer_id);
     info!("Node identity persisted at: {}", config.key_file.display());
@@ -351,8 +351,6 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     }
 
     let mut state = DaemonState::default();
-
-    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut current_reannounce_interval = Duration::from_secs(5);
@@ -370,16 +368,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             }
 
             // Shutdown on SIGTERM
-            _ = async {
-                #[cfg(unix)]
-                {
-                    sigterm.recv().await;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down daemon...");
                 break;
             }
@@ -402,12 +391,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                         if let Some(pending) = state.pending_searches.remove(&query_id) {
                             let providers = format_provider_results(&pending.providers);
                             let response = if providers.is_empty() {
-                                IpcResponse::Error {
-                                    message: format!(
-                                        "Search timed out after {}s while querying IPFS DHT",
-                                        pending.timeout_duration.as_secs()
-                                    ),
-                                }
+                                IpcResponse::error(format!(
+                                    "Search timed out after {}s while querying IPFS DHT",
+                                    pending.timeout_duration.as_secs()
+                                ))
                             } else {
                                 let payload = SearchResultPayload {
                                     service: pending.service_name,
@@ -415,12 +402,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                     providers,
                                     timed_out: true,
                                 };
-                                match serde_json::to_value(payload) {
-                                    Ok(val) => IpcResponse::Success { data: val },
-                                    Err(e) => IpcResponse::Error {
-                                        message: e.to_string(),
-                                    },
-                                }
+                                IpcResponse::success(&payload)
                             };
                             let _ = pending.responder.send(response);
                             debug!("Cleaned up timed-out search query {:?}", query_id);
@@ -485,9 +467,7 @@ async fn handle_ipc_connection(
         let request: IpcRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
-                let resp = IpcResponse::Error {
-                    message: format!("Invalid JSON request: {}", e),
-                };
+                let resp = IpcResponse::error(format!("Invalid JSON request: {}", e));
                 let _ = framed.send(serde_json::to_string(&resp)?).await;
                 continue;
             }
@@ -501,9 +481,7 @@ async fn handle_ipc_connection(
             })
             .await
         {
-            let resp = IpcResponse::Error {
-                message: format!("Daemon internal channel error: {}", e),
-            };
+            let resp = IpcResponse::error(format!("Daemon internal channel error: {}", e));
             let _ = framed.send(serde_json::to_string(&resp)?).await;
             break;
         }
@@ -517,9 +495,7 @@ async fn handle_ipc_connection(
                 }
             }
             Err(_) => {
-                let resp = IpcResponse::Error {
-                    message: "Daemon dropped response channel".to_string(),
-                };
+                let resp = IpcResponse::error("Daemon dropped response channel");
                 let _ = framed.send(serde_json::to_string(&resp)?).await;
                 break;
             }
@@ -561,14 +537,7 @@ fn handle_ipc_request(
                 routing_table_entries,
             };
 
-            let response = match serde_json::to_value(info) {
-                Ok(val) => IpcResponse::Success { data: val },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
-            };
-
-            let _ = responder.send(response);
+            let _ = responder.send(IpcResponse::success(&info));
         }
 
         IpcRequest::Peers => {
@@ -587,14 +556,7 @@ fn handle_ipc_request(
                 .collect();
 
             let payload = PeerListResponse { peers };
-            let response = match serde_json::to_value(payload) {
-                Ok(val) => IpcResponse::Success { data: val },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
-            };
-
-            let _ = responder.send(response);
+            let _ = responder.send(IpcResponse::success(&payload));
         }
 
         IpcRequest::Search {
@@ -1044,13 +1006,7 @@ fn handle_kademlia_event(
                         providers: provider_list,
                         timed_out: false,
                     };
-                    let response = match serde_json::to_value(payload) {
-                        Ok(val) => IpcResponse::Success { data: val },
-                        Err(e) => IpcResponse::Error {
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = pending.responder.send(response);
+                    let _ = pending.responder.send(IpcResponse::success(&payload));
                 }
             }
         }

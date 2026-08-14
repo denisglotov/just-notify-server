@@ -1,5 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::daemon::DaemonConfig;
 
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/just-notify-server.sock";
 pub const DEFAULT_SERVICE_NAME: &str = "org.dymka.just-notify-server";
@@ -32,62 +35,86 @@ pub struct Cli {
     pub command: Commands,
 }
 
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct DaemonArgs {
+    /// TCP listening port
+    #[arg(long, default_value_t = DEFAULT_TCP_PORT)]
+    pub tcp_port: u16,
+
+    /// QUIC listening port (UDP)
+    #[arg(long, default_value_t = DEFAULT_QUIC_PORT)]
+    pub quic_port: u16,
+
+    /// Service name to automatically register on IPFS mainnet DHT
+    #[arg(long, default_value = DEFAULT_SERVICE_NAME)]
+    pub service_name: String,
+
+    /// Interval in seconds to re-announce service provider record to DHT
+    #[arg(long, default_value_t = DEFAULT_REANNOUNCE_INTERVAL_SECS)]
+    pub reannounce_interval: u64,
+
+    /// Path to text file containing bootstrap multiaddresses (one per line)
+    #[arg(long, default_value = DEFAULT_BOOTSTRAP_FILE)]
+    pub bootstrap_nodes_file: PathBuf,
+
+    /// Additional bootstrap multiaddress(es) or direct peer(s)
+    #[arg(long = "bootstrap-node", action = clap::ArgAction::Append)]
+    pub bootstrap_nodes: Vec<String>,
+
+    /// Path to ed25519 identity key file to persist node Peer ID across restarts
+    #[arg(long, default_value = DEFAULT_KEY_FILE)]
+    pub key_file: PathBuf,
+
+    /// Maximum total established peer connections
+    #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_CONNS)]
+    pub max_connections: u32,
+
+    /// Maximum established connections per individual peer
+    #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_PER_PEER)]
+    pub max_connections_per_peer: u32,
+
+    /// Maximum pending incoming connections
+    #[arg(long, default_value_t = DEFAULT_MAX_PENDING_INCOMING_CONNS)]
+    pub max_pending_incoming_connections: u32,
+
+    /// Maximum pending outgoing connections
+    #[arg(long, default_value_t = DEFAULT_MAX_PENDING_OUTGOING_CONNS)]
+    pub max_pending_outgoing_connections: u32,
+
+    /// Maximum number of provider keys stored in memory DHT store
+    #[arg(long, default_value_t = DEFAULT_MAX_PROVIDED_KEYS)]
+    pub max_provided_keys: usize,
+
+    /// Idle connection timeout in seconds before closing inactive connections
+    #[arg(long, default_value_t = DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS)]
+    pub idle_connection_timeout: u64,
+}
+
+impl DaemonArgs {
+    pub fn into_config(self, socket_path: PathBuf) -> DaemonConfig {
+        DaemonConfig {
+            tcp_port: self.tcp_port,
+            quic_port: self.quic_port,
+            socket_path,
+            service_name: self.service_name,
+            reannounce_interval: Duration::from_secs(self.reannounce_interval),
+            bootstrap_nodes_file: self.bootstrap_nodes_file,
+            cli_bootstrap_nodes: self.bootstrap_nodes,
+            key_file: self.key_file,
+            max_connections: self.max_connections,
+            max_connections_per_peer: self.max_connections_per_peer,
+            max_pending_incoming_connections: self.max_pending_incoming_connections,
+            max_pending_outgoing_connections: self.max_pending_outgoing_connections,
+            max_provided_keys: self.max_provided_keys,
+            idle_connection_timeout: Duration::from_secs(self.idle_connection_timeout),
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     /// Start the libp2p IPFS server daemon
-    Daemon {
-        /// TCP listening port
-        #[arg(long, default_value_t = DEFAULT_TCP_PORT)]
-        tcp_port: u16,
-
-        /// QUIC listening port (UDP)
-        #[arg(long, default_value_t = DEFAULT_QUIC_PORT)]
-        quic_port: u16,
-
-        /// Service name to automatically register on IPFS mainnet DHT
-        #[arg(long, default_value = DEFAULT_SERVICE_NAME)]
-        service_name: String,
-
-        /// Interval in seconds to re-announce service provider record to DHT
-        #[arg(long, default_value_t = DEFAULT_REANNOUNCE_INTERVAL_SECS)]
-        reannounce_interval: u64,
-
-        /// Path to text file containing bootstrap multiaddresses (one per line)
-        #[arg(long, default_value = DEFAULT_BOOTSTRAP_FILE)]
-        bootstrap_nodes_file: PathBuf,
-
-        /// Additional bootstrap multiaddress(es) or direct peer(s)
-        #[arg(long = "bootstrap-node", action = clap::ArgAction::Append)]
-        bootstrap_nodes: Vec<String>,
-
-        /// Path to ed25519 identity key file to persist node Peer ID across restarts
-        #[arg(long, default_value = DEFAULT_KEY_FILE)]
-        key_file: PathBuf,
-
-        /// Maximum total established peer connections
-        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_CONNS)]
-        max_connections: u32,
-
-        /// Maximum established connections per individual peer
-        #[arg(long, default_value_t = DEFAULT_MAX_ESTABLISHED_PER_PEER)]
-        max_connections_per_peer: u32,
-
-        /// Maximum pending incoming connections
-        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_INCOMING_CONNS)]
-        max_pending_incoming_connections: u32,
-
-        /// Maximum pending outgoing connections
-        #[arg(long, default_value_t = DEFAULT_MAX_PENDING_OUTGOING_CONNS)]
-        max_pending_outgoing_connections: u32,
-
-        /// Maximum number of provider keys stored in memory DHT store
-        #[arg(long, default_value_t = DEFAULT_MAX_PROVIDED_KEYS)]
-        max_provided_keys: usize,
-
-        /// Idle connection timeout in seconds before closing inactive connections
-        #[arg(long, default_value_t = DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS)]
-        idle_connection_timeout: u64,
-    },
+    Daemon(DaemonArgs),
 
     /// Search IPFS mainnet DHT for providers of a service or CID
     Search {

@@ -32,7 +32,7 @@ impl TryFrom<Commands> for IpcRequest {
             }),
             Commands::Peers => Ok(IpcRequest::Peers),
             Commands::Info => Ok(IpcRequest::Info),
-            daemon @ Commands::Daemon { .. } => Err(daemon),
+            daemon @ Commands::Daemon(..) => Err(daemon),
         }
     }
 }
@@ -42,6 +42,23 @@ impl TryFrom<Commands> for IpcRequest {
 pub enum IpcResponse {
     Success { data: serde_json::Value },
     Error { message: String },
+}
+
+impl IpcResponse {
+    pub fn success<T: Serialize>(data: &T) -> Self {
+        match serde_json::to_value(data) {
+            Ok(val) => IpcResponse::Success { data: val },
+            Err(e) => IpcResponse::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        IpcResponse::Error {
+            message: message.into(),
+        }
+    }
 }
 
 pub const MAX_IPC_FRAME_LENGTH: usize = 1024 * 1024;
