@@ -22,6 +22,36 @@ pub struct DiscoveredProvider {
     pub addresses: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub peer_id: String,
+    pub listen_addresses: Vec<String>,
+    pub external_addresses: Vec<String>,
+    pub connected_peers_count: usize,
+    pub routing_table_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEntry {
+    pub peer_id: String,
+    pub ip_addresses: Vec<String>,
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerListResponse {
+    pub peers: Vec<PeerEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultPayload {
+    pub service: String,
+    pub cid: String,
+    pub providers: Vec<DiscoveredProvider>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+}
+
 struct PendingSearch {
     providers: Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
     sender: oneshot::Sender<Vec<DiscoveredProvider>>,
@@ -445,47 +475,64 @@ fn handle_ipc_request(
 ) {
     match request {
         IpcRequest::Info => {
-            let listen_addrs: Vec<String> = swarm.listeners().map(|a| a.to_string()).collect();
-            let external_addrs: Vec<String> =
-                swarm.external_addresses().map(|a| a.to_string()).collect();
-            let num_peers = swarm.connected_peers().count();
-            let kbucket_count: usize = swarm
+            let listen_addresses: Vec<String> =
+                swarm.listeners().map(ToString::to_string).collect();
+            let external_addresses: Vec<String> = swarm
+                .external_addresses()
+                .map(ToString::to_string)
+                .collect();
+            let connected_peers_count = swarm.connected_peers().count();
+            let routing_table_entries: usize = swarm
                 .behaviour_mut()
                 .kademlia
                 .kbuckets()
                 .map(|b| b.num_entries())
                 .sum();
 
-            let info_json = serde_json::json!({
-                "peer_id": local_peer_id.to_string(),
-                "listen_addresses": listen_addrs,
-                "external_addresses": external_addrs,
-                "connected_peers_count": num_peers,
-                "routing_table_entries": kbucket_count,
-            });
+            let info = DaemonInfo {
+                peer_id: local_peer_id.to_string(),
+                listen_addresses,
+                external_addresses,
+                connected_peers_count,
+                routing_table_entries,
+            };
 
-            let _ = responder.send(IpcResponse::Success { data: info_json });
+            let response = match serde_json::to_value(info) {
+                Ok(val) => IpcResponse::Success { data: val },
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            };
+
+            let _ = responder.send(response);
         }
 
         IpcRequest::Peers => {
-            let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
-            let peers: Vec<_> = connected
+            let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+            let peers: Vec<PeerEntry> = connected
                 .into_iter()
                 .map(|p| {
                     let addrs =
                         get_kademlia_peer_addresses(&mut swarm.behaviour_mut().kademlia, &p);
                     let ip_addresses = extract_ip_addresses(&addrs);
-                    serde_json::json!({
-                        "peer_id": p.to_string(),
-                        "ip_addresses": ip_addresses,
-                        "addresses": addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                    })
+                    let addresses = addrs.iter().map(ToString::to_string).collect();
+                    PeerEntry {
+                        peer_id: p.to_string(),
+                        ip_addresses,
+                        addresses,
+                    }
                 })
                 .collect();
 
-            let _ = responder.send(IpcResponse::Success {
-                data: serde_json::json!({ "peers": peers }),
-            });
+            let payload = PeerListResponse { peers };
+            let response = match serde_json::to_value(payload) {
+                Ok(val) => IpcResponse::Success { data: val },
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            };
+
+            let _ = responder.send(response);
         }
 
         IpcRequest::Search {
@@ -554,42 +601,58 @@ fn handle_ipc_request(
             tokio::spawn(async move {
                 let result = tokio::time::timeout(timeout_duration, search_rx).await;
                 let response = match result {
-                    Ok(Ok(providers)) => IpcResponse::Success {
-                        data: serde_json::json!({
-                            "service": service_name,
-                            "cid": cid.to_string(),
-                            "providers": providers
-                        }),
-                    },
+                    Ok(Ok(providers)) => {
+                        let payload = SearchResultPayload {
+                            service: service_name,
+                            cid: cid.to_string(),
+                            providers,
+                            timed_out: false,
+                        };
+                        match serde_json::to_value(payload) {
+                            Ok(val) => IpcResponse::Success { data: val },
+                            Err(e) => IpcResponse::Error {
+                                message: e.to_string(),
+                            },
+                        }
+                    }
                     Ok(Err(_)) => {
                         let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
                         let providers = format_provider_results(&timeout_providers);
-                        IpcResponse::Success {
-                            data: serde_json::json!({
-                                "service": service_name,
-                                "cid": cid.to_string(),
-                                "providers": providers
-                            }),
+                        let payload = SearchResultPayload {
+                            service: service_name,
+                            cid: cid.to_string(),
+                            providers,
+                            timed_out: false,
+                        };
+                        match serde_json::to_value(payload) {
+                            Ok(val) => IpcResponse::Success { data: val },
+                            Err(e) => IpcResponse::Error {
+                                message: e.to_string(),
+                            },
                         }
                     }
                     Err(_) => {
                         let _ = event_tx.send(DaemonEvent::SearchTimeout { query_id }).await;
                         let providers = format_provider_results(&timeout_providers);
-                        if !providers.is_empty() {
-                            IpcResponse::Success {
-                                data: serde_json::json!({
-                                    "service": service_name,
-                                    "cid": cid.to_string(),
-                                    "providers": providers,
-                                    "timed_out": true
-                                }),
-                            }
-                        } else {
+                        if providers.is_empty() {
                             IpcResponse::Error {
                                 message: format!(
                                     "Search timed out after {}s while querying IPFS DHT",
                                     timeout_duration.as_secs()
                                 ),
+                            }
+                        } else {
+                            let payload = SearchResultPayload {
+                                service: service_name,
+                                cid: cid.to_string(),
+                                providers,
+                                timed_out: true,
+                            };
+                            match serde_json::to_value(payload) {
+                                Ok(val) => IpcResponse::Success { data: val },
+                                Err(e) => IpcResponse::Error {
+                                    message: e.to_string(),
+                                },
                             }
                         }
                     }
@@ -621,22 +684,24 @@ fn record_observed_candidate_address(
         return None;
     }
 
-    // If candidate map is at capacity and this is a new candidate, evict candidate with fewest voters
-    if !observed_candidates_quorum.contains_key(&clean_addr)
-        && observed_candidates_quorum.len() >= MAX_OBSERVED_CANDIDATES
-    {
-        if let Some(least_candidate) = observed_candidates_quorum
-            .iter()
-            .min_by_key(|(_, voters)| voters.len())
-            .map(|(addr, _)| addr.clone())
-        {
-            observed_candidates_quorum.remove(&least_candidate);
+    let voters = if let Some(voters) = observed_candidates_quorum.get_mut(&clean_addr) {
+        voters
+    } else {
+        if observed_candidates_quorum.len() >= MAX_OBSERVED_CANDIDATES {
+            if let Some(least_candidate) = observed_candidates_quorum
+                .iter()
+                .min_by_key(|(_, voters)| voters.len())
+                .map(|(addr, _)| addr)
+                .cloned()
+            {
+                observed_candidates_quorum.remove(&least_candidate);
+            }
         }
-    }
+        observed_candidates_quorum
+            .entry(clean_addr.clone())
+            .or_default()
+    };
 
-    let voters = observed_candidates_quorum
-        .entry(clean_addr.clone())
-        .or_default();
     voters.insert(peer_id);
     let quorum_count = voters.len();
 
@@ -1348,5 +1413,33 @@ mod tests {
         assert!(resolved
             .iter()
             .any(|a| a.to_string().contains("198.51.100.1") && a.to_string().contains("quic-v1")));
+    }
+
+    #[test]
+    fn test_typed_ipc_responses() {
+        let info = DaemonInfo {
+            peer_id: "12D3KooWTestPeer".to_string(),
+            listen_addresses: vec!["/ip4/0.0.0.0/tcp/4001".to_string()],
+            external_addresses: vec!["/ip4/1.2.3.4/tcp/4001".to_string()],
+            connected_peers_count: 5,
+            routing_table_entries: 20,
+        };
+        let info_val = serde_json::to_value(&info).unwrap();
+        assert_eq!(info_val["peer_id"], "12D3KooWTestPeer");
+        assert_eq!(info_val["connected_peers_count"], 5);
+
+        let search = SearchResultPayload {
+            service: "test-srv".to_string(),
+            cid: "bafkreic62cvyvkn5knp2gujymlpzd3y4brmdqlw42n52lt522an2xapsne".to_string(),
+            providers: vec![DiscoveredProvider {
+                peer_id: "12D3KooWProvider".to_string(),
+                addresses: vec!["/ip4/1.2.3.4/tcp/4001".to_string()],
+            }],
+            timed_out: false,
+        };
+        let search_val = serde_json::to_value(&search).unwrap();
+        assert_eq!(search_val["service"], "test-srv");
+        assert_eq!(search_val["providers"][0]["peer_id"], "12D3KooWProvider");
+        assert!(search_val.get("timed_out").is_none());
     }
 }

@@ -16,9 +16,7 @@ pub fn derive_service_multihash(input: &str) -> (Cid, Multihash<64>) {
     }
 
     // Otherwise compute SHA-256 digest of string
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
+    let digest = Sha256::digest(input.as_bytes());
 
     // Multihash code for SHA2-256 is 0x12
     let mhash =
@@ -40,40 +38,34 @@ pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
 
 /// Extracts distinct IP addresses or hostnames from a collection of multiaddresses.
 pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    enum Host<'a> {
-        Ip(std::net::IpAddr),
-        Dns(std::borrow::Cow<'a, str>),
-    }
-
     let mut ip_list: Vec<String> = addrs
         .iter()
         .flat_map(|addr| addr.iter())
         .filter_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::Ip4(ip) => Some(Host::Ip(std::net::IpAddr::V4(ip))),
-            libp2p::multiaddr::Protocol::Ip6(ip) => Some(Host::Ip(std::net::IpAddr::V6(ip))),
+            libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+            libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
             libp2p::multiaddr::Protocol::Dns(dns)
             | libp2p::multiaddr::Protocol::Dns4(dns)
             | libp2p::multiaddr::Protocol::Dns6(dns)
-            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(Host::Dns(dns)),
+            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(dns.into_owned()),
             _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .map(|h| match h {
-            Host::Ip(ip) => ip.to_string(),
-            Host::Dns(dns) => dns.into_owned(),
         })
         .collect();
 
-    ip_list.sort();
+    ip_list.sort_unstable();
+    ip_list.dedup();
     ip_list
+}
+
+#[inline]
+fn is_valid_public_dns(dns: &str) -> bool {
+    dns != "localhost" && dns.contains('.')
 }
 
 /// Checks if an IPv4 address is globally routable on the public internet.
 /// Filters out private (RFC 1918), loopback (127.0.0.0/8), link-local (169.254.0.0/16),
 /// CGNAT / Shared address space (100.64.0.0/10), documentation, benchmarking, multicast, and broadcast/unspecified.
-pub fn is_public_routable_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+pub fn is_public_routable_ipv4(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
     // Unspecified (0.0.0.0) or Broadcast (255.255.255.255)
     if ip.is_unspecified() || ip.is_broadcast() {
@@ -158,21 +150,41 @@ pub fn normalize_observed_address(
 ) -> Option<libp2p::Multiaddr> {
     use libp2p::multiaddr::Protocol;
 
-    let host = observed.iter().find_map(|proto| match proto {
-        Protocol::Ip4(ip) if is_public_routable_ipv4(&ip) => Some(Protocol::Ip4(ip)),
-        Protocol::Ip6(ip) if is_public_routable_ipv6(&ip) => Some(Protocol::Ip6(ip)),
-        Protocol::Dns(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns(dns)),
-        Protocol::Dns4(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns4(dns)),
-        Protocol::Dns6(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns6(dns)),
-        Protocol::Dnsaddr(dns) if dns != "localhost" && dns.contains('.') => {
-            Some(Protocol::Dnsaddr(dns))
+    let mut host = None;
+    let mut is_quic = false;
+    let mut is_tcp = false;
+
+    for proto in observed {
+        match proto {
+            Protocol::Ip4(ip) if host.is_none() && is_public_routable_ipv4(ip) => {
+                host = Some(Protocol::Ip4(ip));
+            }
+            Protocol::Ip6(ip) if host.is_none() && is_public_routable_ipv6(&ip) => {
+                host = Some(Protocol::Ip6(ip));
+            }
+            Protocol::Dns(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns(dns));
+            }
+            Protocol::Dns4(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns4(dns));
+            }
+            Protocol::Dns6(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dns6(dns));
+            }
+            Protocol::Dnsaddr(dns) if host.is_none() && is_valid_public_dns(&dns) => {
+                host = Some(Protocol::Dnsaddr(dns));
+            }
+            Protocol::QuicV1 => {
+                is_quic = true;
+            }
+            Protocol::Tcp(_) => {
+                is_tcp = true;
+            }
+            _ => {}
         }
-        _ => None,
-    })?;
+    }
 
-    let is_quic = observed.iter().any(|p| matches!(p, Protocol::QuicV1));
-    let is_tcp = observed.iter().any(|p| matches!(p, Protocol::Tcp(_)));
-
+    let host = host?;
     let mut normalized = libp2p::Multiaddr::empty();
     normalized.push(host);
 
@@ -363,35 +375,35 @@ mod tests {
         use std::net::Ipv4Addr;
 
         // Valid public IPs
-        assert!(is_public_routable_ipv4(&Ipv4Addr::new(136, 169, 50, 80)));
-        assert!(is_public_routable_ipv4(&Ipv4Addr::new(172, 238, 169, 224)));
-        assert!(is_public_routable_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(is_public_routable_ipv4(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(136, 169, 50, 80)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(172, 238, 169, 224)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(1, 1, 1, 1)));
 
         // Private RFC 1918
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(10, 60, 7, 102)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(172, 16, 0, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(172, 31, 255, 255)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 168, 50, 156)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(10, 60, 7, 102)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(172, 16, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(172, 31, 255, 255)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 168, 50, 156)));
 
         // Loopback / Link-local / Unspecified / Broadcast
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(127, 0, 0, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(169, 254, 1, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(0, 0, 0, 0)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(255, 255, 255, 255)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(255, 255, 255, 255)));
 
         // CGNAT (100.64.0.0/10)
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(100, 64, 0, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(100, 127, 255, 254)));
         // 100.128.0.1 is outside CGNAT range
-        assert!(is_public_routable_ipv4(&Ipv4Addr::new(100, 128, 0, 1)));
+        assert!(is_public_routable_ipv4(Ipv4Addr::new(100, 128, 0, 1)));
 
         // Documentation / Multicast
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(192, 0, 2, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(224, 0, 0, 1)));
-        assert!(!is_public_routable_ipv4(&Ipv4Addr::new(240, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!is_public_routable_ipv4(Ipv4Addr::new(240, 0, 0, 1)));
     }
 
     #[test]
