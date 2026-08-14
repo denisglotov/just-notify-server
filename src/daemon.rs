@@ -1,6 +1,6 @@
 use crate::behaviour::{AppBehaviour, AppBehaviourEvent};
 use crate::ipc::{IpcRequest, IpcResponse, MAX_IPC_FRAME_LENGTH};
-use crate::service_key::{self, extract_ip_addresses, extract_peer_id, normalize_observed_address};
+use crate::service_key::{self, extract_peer_id, normalize_observed_address};
 
 use anyhow::Context;
 use futures::{SinkExt, StreamExt};
@@ -35,7 +35,6 @@ pub struct DaemonInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub peer_id: String,
-    pub ip_addresses: Vec<String>,
     pub addresses: Vec<String>,
 }
 
@@ -579,11 +578,9 @@ fn handle_ipc_request(
                 .map(|p| {
                     let addrs =
                         get_kademlia_peer_addresses(&mut swarm.behaviour_mut().kademlia, &p);
-                    let ip_addresses = extract_ip_addresses(&addrs);
                     let addresses = addrs.iter().map(ToString::to_string).collect();
                     PeerEntry {
                         peer_id: p.to_string(),
-                        ip_addresses,
                         addresses,
                     }
                 })

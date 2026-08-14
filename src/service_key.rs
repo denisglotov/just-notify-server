@@ -36,27 +36,6 @@ pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
     })
 }
 
-/// Extracts distinct IP addresses or hostnames from a collection of multiaddresses.
-pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
-    let mut ip_list: Vec<String> = addrs
-        .iter()
-        .flat_map(|addr| addr.iter())
-        .filter_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
-            libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
-            libp2p::multiaddr::Protocol::Dns(dns)
-            | libp2p::multiaddr::Protocol::Dns4(dns)
-            | libp2p::multiaddr::Protocol::Dns6(dns)
-            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(dns.into_owned()),
-            _ => None,
-        })
-        .collect();
-
-    ip_list.sort_unstable();
-    ip_list.dedup();
-    ip_list
-}
-
 #[inline]
 fn is_valid_public_dns(dns: &str) -> bool {
     dns != "localhost" && dns.contains('.')
@@ -301,34 +280,6 @@ mod tests {
         assert_eq!(
             peer_id.to_string(),
             "QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
-        );
-    }
-
-    /// Verifies extraction, deduplication, and sorting of host IPs and DNS names from diverse multiaddresses.
-    ///
-    /// - Formats discovered provider addresses and peer lists into human-readable IP and DNS listings.
-    /// - Prevents duplicate addresses when a peer supports multiple transport protocols (e.g. TCP + QUIC) on the same IP.
-    #[test]
-    fn test_extract_ip_addresses() {
-        let addr1: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
-        let addr2: libp2p::Multiaddr = "/ip4/192.168.1.100/udp/4001/quic-v1".parse().unwrap();
-        let addr3: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/4001".parse().unwrap();
-        let addr4: libp2p::Multiaddr = "/dns4/ny5.bootstrap.libp2p.io/tcp/4001".parse().unwrap();
-        let addr5: libp2p::Multiaddr = "/dns6/ny5.bootstrap.libp2p.io/udp/4001/quic-v1"
-            .parse()
-            .unwrap();
-        let addr6: libp2p::Multiaddr = "/ip6/2600:1900::1/tcp/4001".parse().unwrap();
-        let addr7: libp2p::Multiaddr = "/ip6/2600:1900::1/udp/4001/quic-v1".parse().unwrap();
-
-        let ips = extract_ip_addresses(&[addr1, addr2, addr3, addr4, addr5, addr6, addr7]);
-        assert_eq!(
-            ips,
-            vec![
-                "10.0.0.1".to_string(),
-                "192.168.1.100".to_string(),
-                "2600:1900::1".to_string(),
-                "ny5.bootstrap.libp2p.io".to_string()
-            ]
         );
     }
 
