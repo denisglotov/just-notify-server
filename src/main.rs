@@ -69,13 +69,16 @@ async fn main() -> anyhow::Result<()> {
 
 fn handle_ipc_result(result: anyhow::Result<IpcResponse>) {
     match result {
-        Ok(IpcResponse::Success { data }) => {
-            if let Ok(json) = serde_json::to_string_pretty(&data) {
-                println!("{}", json);
+        Ok(IpcResponse::Success { data }) => match serde_json::to_string_pretty(&data) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Failed to format response JSON: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         Ok(IpcResponse::Error { message }) => {
             eprintln!("Daemon returned error: {}", message);
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("IPC Error: {}", e);

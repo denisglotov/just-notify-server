@@ -44,18 +44,13 @@ pub enum IpcResponse {
     Error { message: String },
 }
 
+pub const MAX_IPC_FRAME_LENGTH: usize = 1024 * 1024;
+
 /// Connects to daemon UDS socket, sends a request, and returns the response.
 pub async fn send_ipc_request(
     socket_path: &Path,
     request: &IpcRequest,
 ) -> anyhow::Result<IpcResponse> {
-    if !socket_path.exists() {
-        anyhow::bail!(
-            "Daemon socket does not exist at '{}'. Please start the daemon first with: 'just-notify-server daemon'",
-            socket_path.display()
-        );
-    }
-
     let stream = match UnixStream::connect(socket_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -72,7 +67,10 @@ pub async fn send_ipc_request(
         }
         Err(e) => return Err(e.into()),
     };
-    let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(1024 * 1024));
+    let mut framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(MAX_IPC_FRAME_LENGTH),
+    );
 
     let json_req = serde_json::to_string(request)?;
     framed.send(json_req).await?;

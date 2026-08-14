@@ -40,21 +40,34 @@ pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
 
 /// Extracts distinct IP addresses or hostnames from a collection of multiaddresses.
 pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
-    addrs
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Host<'a> {
+        Ip(std::net::IpAddr),
+        Dns(std::borrow::Cow<'a, str>),
+    }
+
+    let mut ip_list: Vec<String> = addrs
         .iter()
         .flat_map(|addr| addr.iter())
         .filter_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
-            libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+            libp2p::multiaddr::Protocol::Ip4(ip) => Some(Host::Ip(std::net::IpAddr::V4(ip))),
+            libp2p::multiaddr::Protocol::Ip6(ip) => Some(Host::Ip(std::net::IpAddr::V6(ip))),
             libp2p::multiaddr::Protocol::Dns(dns)
             | libp2p::multiaddr::Protocol::Dns4(dns)
             | libp2p::multiaddr::Protocol::Dns6(dns)
-            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(dns.to_string()),
+            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(Host::Dns(dns)),
             _ => None,
         })
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .collect()
+        .map(|h| match h {
+            Host::Ip(ip) => ip.to_string(),
+            Host::Dns(dns) => dns.into_owned(),
+        })
+        .collect();
+
+    ip_list.sort();
+    ip_list
 }
 
 /// Checks if an IPv4 address is globally routable on the public internet.
@@ -145,45 +158,21 @@ pub fn normalize_observed_address(
 ) -> Option<libp2p::Multiaddr> {
     use libp2p::multiaddr::Protocol;
 
-    let mut host_protocol = None;
-    let mut is_quic = false;
-    let mut is_tcp = false;
-
-    for proto in observed.iter() {
-        match proto {
-            Protocol::Ip4(ip) => {
-                if is_public_routable_ipv4(&ip) {
-                    host_protocol = Some(Protocol::Ip4(ip));
-                }
-            }
-            Protocol::Ip6(ip) => {
-                if is_public_routable_ipv6(&ip) {
-                    host_protocol = Some(Protocol::Ip6(ip));
-                }
-            }
-            Protocol::Dns(dns) if dns != "localhost" && dns.contains('.') => {
-                host_protocol = Some(Protocol::Dns(dns));
-            }
-            Protocol::Dns4(dns) if dns != "localhost" && dns.contains('.') => {
-                host_protocol = Some(Protocol::Dns4(dns));
-            }
-            Protocol::Dns6(dns) if dns != "localhost" && dns.contains('.') => {
-                host_protocol = Some(Protocol::Dns6(dns));
-            }
-            Protocol::Dnsaddr(dns) if dns != "localhost" && dns.contains('.') => {
-                host_protocol = Some(Protocol::Dnsaddr(dns));
-            }
-            Protocol::QuicV1 => {
-                is_quic = true;
-            }
-            Protocol::Tcp(_) => {
-                is_tcp = true;
-            }
-            _ => {}
+    let host = observed.iter().find_map(|proto| match proto {
+        Protocol::Ip4(ip) if is_public_routable_ipv4(&ip) => Some(Protocol::Ip4(ip)),
+        Protocol::Ip6(ip) if is_public_routable_ipv6(&ip) => Some(Protocol::Ip6(ip)),
+        Protocol::Dns(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns(dns)),
+        Protocol::Dns4(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns4(dns)),
+        Protocol::Dns6(dns) if dns != "localhost" && dns.contains('.') => Some(Protocol::Dns6(dns)),
+        Protocol::Dnsaddr(dns) if dns != "localhost" && dns.contains('.') => {
+            Some(Protocol::Dnsaddr(dns))
         }
-    }
+        _ => None,
+    })?;
 
-    let host = host_protocol?;
+    let is_quic = observed.iter().any(|p| matches!(p, Protocol::QuicV1));
+    let is_tcp = observed.iter().any(|p| matches!(p, Protocol::Tcp(_)));
+
     let mut normalized = libp2p::Multiaddr::empty();
     normalized.push(host);
 
@@ -220,13 +209,33 @@ pub fn load_or_generate_keypair(
         }
 
         let keypair = libp2p::identity::Keypair::generate_ed25519();
-        if let Ok(bytes) = keypair.to_protobuf_encoding() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+        let bytes = keypair
+            .to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("Failed to encode generated keypair: {:?}", e))?;
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true).mode(0o600);
+            let mut file = options.open(path).with_context(|| {
+                format!("Failed to create keypair file at '{}'", path.display())
+            })?;
+            file.write_all(&bytes)
+                .with_context(|| format!("Failed to write keypair file at '{}'", path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
             std::fs::write(path, &bytes)
                 .with_context(|| format!("Failed to save keypair file to '{}'", path.display()))?;
         }
+
         Ok(keypair)
     } else {
         Ok(libp2p::identity::Keypair::generate_ed25519())
@@ -277,13 +286,19 @@ mod tests {
         let addr2: libp2p::Multiaddr = "/ip4/192.168.1.100/udp/4001/quic-v1".parse().unwrap();
         let addr3: libp2p::Multiaddr = "/ip4/10.0.0.1/tcp/4001".parse().unwrap();
         let addr4: libp2p::Multiaddr = "/dns4/ny5.bootstrap.libp2p.io/tcp/4001".parse().unwrap();
+        let addr5: libp2p::Multiaddr = "/dns6/ny5.bootstrap.libp2p.io/udp/4001/quic-v1"
+            .parse()
+            .unwrap();
+        let addr6: libp2p::Multiaddr = "/ip6/2600:1900::1/tcp/4001".parse().unwrap();
+        let addr7: libp2p::Multiaddr = "/ip6/2600:1900::1/udp/4001/quic-v1".parse().unwrap();
 
-        let ips = extract_ip_addresses(&[addr1, addr2, addr3, addr4]);
+        let ips = extract_ip_addresses(&[addr1, addr2, addr3, addr4, addr5, addr6, addr7]);
         assert_eq!(
             ips,
             vec![
                 "10.0.0.1".to_string(),
                 "192.168.1.100".to_string(),
+                "2600:1900::1".to_string(),
                 "ny5.bootstrap.libp2p.io".to_string()
             ]
         );

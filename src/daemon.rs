@@ -1,5 +1,5 @@
 use crate::behaviour::{AppBehaviour, AppBehaviourEvent};
-use crate::ipc::{IpcRequest, IpcResponse};
+use crate::ipc::{IpcRequest, IpcResponse, MAX_IPC_FRAME_LENGTH};
 use crate::service_key::{self, extract_ip_addresses, extract_peer_id, normalize_observed_address};
 
 use anyhow::Context;
@@ -58,9 +58,7 @@ fn load_bootstrap_nodes(
     file_path: &std::path::Path,
     cli_nodes: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let mut all_nodes = Vec::new();
-
-    if file_path.exists() {
+    let file_nodes = if file_path.exists() {
         let content = std::fs::read_to_string(file_path).with_context(|| {
             format!(
                 "Failed to read bootstrap nodes file at '{}'",
@@ -70,9 +68,9 @@ fn load_bootstrap_nodes(
 
         let nodes: Vec<String> = content
             .lines()
-            .map(|line| line.trim())
+            .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_string())
+            .map(String::from)
             .collect();
 
         info!(
@@ -80,15 +78,20 @@ fn load_bootstrap_nodes(
             nodes.len(),
             file_path.display()
         );
-        all_nodes.extend(nodes);
+        nodes
     } else if cli_nodes.is_empty() {
         anyhow::bail!(
             "Bootstrap nodes file does not exist at '{}' and no --bootstrap-node CLI options provided.",
             file_path.display()
         );
-    }
+    } else {
+        Vec::new()
+    };
 
-    all_nodes.extend(cli_nodes.iter().cloned());
+    let all_nodes: Vec<String> = file_nodes
+        .into_iter()
+        .chain(cli_nodes.iter().cloned())
+        .collect();
 
     if all_nodes.is_empty() {
         anyhow::bail!("No valid bootstrap nodes provided");
@@ -371,7 +374,10 @@ async fn handle_ipc_connection(
     stream: UnixStream,
     ipc_tx: mpsc::Sender<DaemonEvent>,
 ) -> anyhow::Result<()> {
-    let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(1024 * 1024));
+    let mut framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(MAX_IPC_FRAME_LENGTH),
+    );
 
     while let Some(line_res) = framed.next().await {
         let line = match line_res {
@@ -462,10 +468,8 @@ fn handle_ipc_request(
         }
 
         IpcRequest::Peers => {
-            let peers: Vec<_> = swarm
-                .connected_peers()
-                .cloned()
-                .collect::<Vec<_>>()
+            let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+            let peers: Vec<_> = connected
                 .into_iter()
                 .map(|p| {
                     let addrs =
@@ -1015,27 +1019,30 @@ fn get_kademlia_peer_addresses(
     kademlia: &mut kad::Behaviour<kad::store::MemoryStore>,
     peer: &PeerId,
 ) -> Vec<Multiaddr> {
-    for bucket in kademlia.kbuckets() {
-        for entry in bucket.iter() {
-            if entry.node.key.preimage() == peer {
-                return entry.node.value.clone().into_vec();
-            }
-        }
-    }
-    Vec::new()
+    kademlia
+        .kbuckets()
+        .find_map(|bucket| {
+            bucket
+                .iter()
+                .find(|entry| entry.node.key.preimage() == peer)
+                .map(|entry| entry.node.value.clone().into_vec())
+        })
+        .unwrap_or_default()
 }
 
 fn format_record_key(key: &kad::RecordKey) -> String {
     let bytes = key.as_ref();
-    if let Ok(mhash) = libp2p::multihash::Multihash::<64>::from_bytes(bytes) {
-        let cid = cid::Cid::new_v1(0x55, mhash);
-        format!("{}", cid)
-    } else {
-        bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    }
+    libp2p::multihash::Multihash::<64>::from_bytes(bytes)
+        .map(|mhash| cid::Cid::new_v1(0x55, mhash).to_string())
+        .unwrap_or_else(|_| {
+            use std::fmt::Write;
+            bytes
+                .iter()
+                .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                    let _ = write!(acc, "{:02x}", b);
+                    acc
+                })
+        })
 }
 
 #[cfg(test)]
