@@ -32,39 +32,29 @@ pub fn derive_service_multihash(input: &str) -> (Cid, Multihash<64>) {
 
 /// Extracts a PeerId from a multiaddress if it contains a /p2p/<peer_id> component.
 pub fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
-    for protocol in addr.iter() {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = protocol {
-            return Some(peer_id);
-        }
-    }
-    None
+    addr.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
 }
 
 /// Extracts distinct IP addresses or hostnames from a collection of multiaddresses.
 pub fn extract_ip_addresses(addrs: &[libp2p::Multiaddr]) -> Vec<String> {
-    let mut ips = std::collections::HashSet::new();
-    for addr in addrs {
-        for protocol in addr.iter() {
-            match protocol {
-                libp2p::multiaddr::Protocol::Ip4(ip) => {
-                    ips.insert(ip.to_string());
-                }
-                libp2p::multiaddr::Protocol::Ip6(ip) => {
-                    ips.insert(ip.to_string());
-                }
-                libp2p::multiaddr::Protocol::Dns(dns)
-                | libp2p::multiaddr::Protocol::Dns4(dns)
-                | libp2p::multiaddr::Protocol::Dns6(dns)
-                | libp2p::multiaddr::Protocol::Dnsaddr(dns) => {
-                    ips.insert(dns.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut ip_list: Vec<String> = ips.into_iter().collect();
-    ip_list.sort();
-    ip_list
+    addrs
+        .iter()
+        .flat_map(|addr| addr.iter())
+        .filter_map(|protocol| match protocol {
+            libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+            libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+            libp2p::multiaddr::Protocol::Dns(dns)
+            | libp2p::multiaddr::Protocol::Dns4(dns)
+            | libp2p::multiaddr::Protocol::Dns6(dns)
+            | libp2p::multiaddr::Protocol::Dnsaddr(dns) => Some(dns.to_string()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Checks if an IPv4 address is globally routable on the public internet.

@@ -432,10 +432,12 @@ fn handle_ipc_request(
             let external_addrs: Vec<String> =
                 swarm.external_addresses().map(|a| a.to_string()).collect();
             let num_peers = swarm.connected_peers().count();
-            let mut kbucket_count = 0;
-            for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
-                kbucket_count += bucket.num_entries();
-            }
+            let kbucket_count: usize = swarm
+                .behaviour_mut()
+                .kademlia
+                .kbuckets()
+                .map(|b| b.num_entries())
+                .sum();
 
             let info_json = serde_json::json!({
                 "peer_id": local_peer_id.to_string(),
@@ -449,17 +451,22 @@ fn handle_ipc_request(
         }
 
         IpcRequest::Peers => {
-            let connected: Vec<PeerId> = swarm.connected_peers().cloned().collect();
-            let mut peers = Vec::new();
-            for p in connected {
-                let addrs = get_kademlia_peer_addresses(&mut swarm.behaviour_mut().kademlia, &p);
-                let ip_addresses = extract_ip_addresses(&addrs);
-                peers.push(serde_json::json!({
-                    "peer_id": p.to_string(),
-                    "ip_addresses": ip_addresses,
-                    "addresses": addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                }));
-            }
+            let peers: Vec<_> = swarm
+                .connected_peers()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|p| {
+                    let addrs =
+                        get_kademlia_peer_addresses(&mut swarm.behaviour_mut().kademlia, &p);
+                    let ip_addresses = extract_ip_addresses(&addrs);
+                    serde_json::json!({
+                        "peer_id": p.to_string(),
+                        "ip_addresses": ip_addresses,
+                        "addresses": addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
 
             let _ = responder.send(IpcResponse::Success {
                 data: serde_json::json!({ "peers": peers }),
@@ -690,15 +697,7 @@ fn handle_swarm_event(
             }
 
             // Update any active search that is waiting for this peer's addresses
-            for search in pending_searches.values() {
-                let mut lock = match search.providers.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if let Some(addrs) = lock.get_mut(&peer_id) {
-                    addrs.extend(info.listen_addrs.clone());
-                }
-            }
+            update_pending_searches_for_peer(pending_searches, &peer_id, &info.listen_addrs);
 
             // Kademlia requires insertion of discovered peers into its routing table
             for addr in info.listen_addrs {
@@ -833,17 +832,7 @@ fn handle_kademlia_event(
                             &mut swarm.behaviour_mut().kademlia,
                             &target_peer,
                         );
-                        if !addrs.is_empty() {
-                            for search in pending_searches.values() {
-                                let mut lock = match search.providers.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                if let Some(peer_addrs) = lock.get_mut(&target_peer) {
-                                    peer_addrs.extend(addrs.clone());
-                                }
-                            }
-                        }
+                        update_pending_searches_for_peer(pending_searches, &target_peer, &addrs);
                     }
                     let _ = key;
                 }
@@ -905,36 +894,50 @@ fn handle_kademlia_event(
         } => {
             let addrs: Vec<Multiaddr> = addresses.iter().cloned().collect();
             // Update active searches with newly discovered addresses
-            for search in pending_searches.values() {
-                let mut lock = match search.providers.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if let Some(peer_addrs) = lock.get_mut(&peer) {
-                    peer_addrs.extend(addrs.clone());
-                }
-            }
+            update_pending_searches_for_peer(pending_searches, &peer, &addrs);
         }
         _ => {}
     }
 }
 
+fn update_pending_searches_for_peer(
+    pending_searches: &HashMap<kad::QueryId, PendingSearch>,
+    peer: &PeerId,
+    new_addrs: &[Multiaddr],
+) {
+    if new_addrs.is_empty() || pending_searches.is_empty() {
+        return;
+    }
+    pending_searches.values().for_each(|search| {
+        let mut lock = search
+            .providers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(peer_addrs) = lock.get_mut(peer) {
+            peer_addrs.extend(new_addrs.iter().cloned());
+        }
+    });
+}
+
 fn format_provider_results(
     providers_ref: &Arc<Mutex<HashMap<PeerId, HashSet<Multiaddr>>>>,
 ) -> Vec<DiscoveredProvider> {
-    let map = match providers_ref.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let mut list = Vec::new();
-    for (peer, addrs_set) in map.iter() {
-        let mut addrs: Vec<Multiaddr> = addrs_set.iter().cloned().collect();
-        addrs.sort();
-        list.push(DiscoveredProvider {
-            peer_id: peer.to_string(),
-            addresses: addrs.into_iter().map(|a| a.to_string()).collect(),
-        });
-    }
+    let map = providers_ref
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut list: Vec<_> = map
+        .iter()
+        .map(|(peer, addrs_set)| {
+            let mut addresses: Vec<String> = addrs_set.iter().map(|a| a.to_string()).collect();
+            addresses.sort();
+            DiscoveredProvider {
+                peer_id: peer.to_string(),
+                addresses,
+            }
+        })
+        .collect();
+
     list.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
     list
 }
