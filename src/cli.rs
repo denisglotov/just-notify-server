@@ -18,6 +18,7 @@ pub const DEFAULT_MAX_PENDING_INCOMING_CONNS: u32 = 64;
 pub const DEFAULT_MAX_PENDING_OUTGOING_CONNS: u32 = 64;
 pub const DEFAULT_MAX_PROVIDED_KEYS: usize = 65_536;
 pub const DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_PINNING_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 
 #[derive(Parser, Debug)]
 #[command(name = "just-notify-server")]
@@ -52,6 +53,10 @@ pub struct DaemonArgs {
     /// Interval in seconds to re-announce service provider record to DHT
     #[arg(long, default_value_t = DEFAULT_REANNOUNCE_INTERVAL_SECS)]
     pub reannounce_interval: u64,
+
+    /// Interval in seconds to redial disconnected pinned peers
+    #[arg(long, default_value_t = DEFAULT_PINNING_MAINTENANCE_INTERVAL_SECS)]
+    pub pinning_maintenance_interval: u64,
 
     /// Path to text file containing bootstrap multiaddresses (one per line)
     #[arg(long, default_value = DEFAULT_BOOTSTRAP_FILE)]
@@ -98,6 +103,7 @@ impl DaemonArgs {
             socket_path,
             service_name: self.service_name,
             reannounce_interval: Duration::from_secs(self.reannounce_interval),
+            pinning_maintenance_interval: Duration::from_secs(self.pinning_maintenance_interval),
             bootstrap_nodes_file: self.bootstrap_nodes_file,
             cli_bootstrap_nodes: self.bootstrap_nodes,
             key_file: self.key_file,
