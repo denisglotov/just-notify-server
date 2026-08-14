@@ -7,12 +7,19 @@ mod service_key;
 use clap::Parser;
 use cli::{Cli, Commands};
 use ipc::{send_ipc_request, IpcRequest, IpcResponse};
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::builder().parse_lossy(&cli.log_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
 
     match cli.command {
         Commands::Daemon {
@@ -24,22 +31,7 @@ async fn main() -> anyhow::Result<()> {
             bootstrap_nodes_file,
             bootstrap_nodes,
             key_file,
-            log_level,
         } => {
-            let filter = EnvFilter::builder()
-                .with_default_directive(
-                    log_level
-                        .parse::<LevelFilter>()
-                        .unwrap_or(LevelFilter::INFO)
-                        .into(),
-                )
-                .from_env_lossy();
-
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
-
             daemon::run_daemon(
                 tcp_port,
                 quic_port,

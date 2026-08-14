@@ -596,9 +596,7 @@ fn handle_swarm_event(
             info!("Listening on multiaddress: {}", address);
         }
         libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-            if let Some(clean_addr) =
-                normalize_observed_address(&address, tcp_port, quic_port)
-            {
+            if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
                 if known_external_addrs.insert(clean_addr.clone()) {
                     info!("Confirmed external public address: {}", clean_addr);
                     swarm.add_external_address(clean_addr);
@@ -613,9 +611,7 @@ fn handle_swarm_event(
             }
         }
         libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
-            if let Some(clean_addr) =
-                normalize_observed_address(&address, tcp_port, quic_port)
-            {
+            if let Some(clean_addr) = normalize_observed_address(&address, tcp_port, quic_port) {
                 known_external_addrs.remove(&clean_addr);
                 swarm.remove_external_address(&clean_addr);
                 info!("External public address expired: {}", clean_addr);
@@ -680,7 +676,10 @@ fn handle_swarm_event(
                         .kademlia
                         .start_providing(record_key.clone())
                     {
-                        debug!("Start providing on quorum external address confirmation: {:?}", e);
+                        debug!(
+                            "Start providing on quorum external address confirmation: {:?}",
+                            e
+                        );
                     }
                 } else if quorum_count < OBSERVED_ADDR_QUORUM_THRESHOLD {
                     debug!(
@@ -731,20 +730,14 @@ fn handle_swarm_event(
                             normalize_observed_address(public_addr, tcp_port, quic_port)
                         {
                             if known_external_addrs.insert(clean_addr.clone()) {
-                                info!(
-                                    "AutoNAT confirmed public external address: {}",
-                                    clean_addr
-                                );
+                                info!("AutoNAT confirmed public external address: {}", clean_addr);
                                 swarm.add_external_address(clean_addr);
                                 if let Err(e) = swarm
                                     .behaviour_mut()
                                     .kademlia
                                     .start_providing(record_key.clone())
                                 {
-                                    debug!(
-                                        "Start providing on AutoNAT confirmation: {:?}",
-                                        e
-                                    );
+                                    debug!("Start providing on AutoNAT confirmation: {:?}", e);
                                 }
                             }
                         }

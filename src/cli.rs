@@ -5,6 +5,10 @@ use std::path::PathBuf;
 #[command(name = "just-notify-server")]
 #[command(about = "IPFS-compatible libp2p server daemon and control CLI", long_about = None)]
 pub struct Cli {
+    /// Tracing log level filter (e.g. info, debug, warn, trace, error)
+    #[arg(long, global = true, default_value = "info")]
+    pub log_level: String,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -44,10 +48,6 @@ pub enum Commands {
         /// Path to ed25519 identity key file to persist node Peer ID across restarts
         #[arg(long, default_value = "node.key")]
         key_file: PathBuf,
-
-        /// Tracing log level filter (e.g. info, debug, warn, trace)
-        #[arg(long, default_value = "info")]
-        log_level: String,
     },
 
     /// Search IPFS mainnet DHT for providers of a service or CID
