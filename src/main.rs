@@ -4,9 +4,9 @@ mod daemon;
 mod ipc;
 mod service_key;
 
+use crate::cli::{Cli, Commands};
+use crate::ipc::{send_ipc_request, IpcRequest, IpcResponse};
 use clap::Parser;
-use cli::{Cli, Commands};
-use ipc::{send_ipc_request, IpcRequest, IpcResponse};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

@@ -965,3 +965,123 @@ fn format_record_key(key: &kad::RecordKey) -> String {
             .collect::<String>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc;
+
+    #[tokio::test]
+    async fn test_daemon_stress_and_resilience() {
+        let temp_dir = std::env::temp_dir();
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_path = temp_dir.join(format!("test_daemon_{}.sock", unique_id));
+        let key_file = temp_dir.join(format!("test_daemon_{}.key", unique_id));
+
+        let sock_clone = socket_path.clone();
+        let key_clone = key_file.clone();
+        let daemon_handle = tokio::spawn(async move {
+            let res = run_daemon(
+                0,
+                0,
+                sock_clone,
+                "test-service".to_string(),
+                3600,
+                PathBuf::from("non_existent_bootstrap.txt"),
+                vec![
+                    "/ip4/127.0.0.1/tcp/49999/p2p/QmNnooDu7bfjPFoTmdxMNeaVQEBTbkV4Ddbdb415D9x5D4"
+                        .to_string(),
+                ],
+                key_clone,
+            )
+            .await;
+            if let Err(e) = res {
+                eprintln!("run_daemon returned error: {:?}", e);
+            }
+        });
+
+        // Wait for daemon socket to be created
+        let mut ready = false;
+        for _ in 0..100 {
+            if socket_path.exists() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "Daemon socket was not created in time");
+
+        // 1. Send multiple sequential requests
+        for i in 0..15 {
+            let req = if i % 2 == 0 {
+                IpcRequest::Info
+            } else {
+                IpcRequest::Peers
+            };
+            let resp = ipc::send_ipc_request(&socket_path, &req).await;
+            assert!(
+                resp.is_ok(),
+                "Sequential request {} failed: {:?}",
+                i,
+                resp.err()
+            );
+        }
+
+        // 2. Send invalid JSON over raw socket, ensure daemon survives
+        {
+            let stream = UnixStream::connect(&socket_path).await.unwrap();
+            let mut framed = Framed::new(stream, LinesCodec::new());
+            framed.send("NOT_JSON_DATA".to_string()).await.unwrap();
+            drop(framed);
+        }
+
+        // 3. Connect and immediately close socket without sending anything (aborted connection)
+        for _ in 0..5 {
+            let stream = UnixStream::connect(&socket_path).await.unwrap();
+            drop(stream);
+        }
+
+        // 4. Send concurrent requests from multiple tasks
+        let mut handles = Vec::new();
+        for i in 0..25 {
+            let sock = socket_path.clone();
+            let handle = tokio::spawn(async move {
+                let req = if i % 2 == 0 {
+                    IpcRequest::Info
+                } else {
+                    IpcRequest::Peers
+                };
+                ipc::send_ipc_request(&sock, &req).await
+            });
+            handles.push(handle);
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            let res = h.await.unwrap();
+            assert!(
+                res.is_ok(),
+                "Concurrent request {} failed: {:?}",
+                i,
+                res.err()
+            );
+        }
+
+        // 5. Ensure daemon is still responsive after all stress/errors
+        for i in 0..5 {
+            let resp = ipc::send_ipc_request(&socket_path, &IpcRequest::Info).await;
+            assert!(
+                resp.is_ok(),
+                "Post-stress request {} failed: {:?}",
+                i,
+                resp.err()
+            );
+        }
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&key_file);
+    }
+}
